@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="humanoid_controller" exec="humanoid_controller_node" name="humanoid_controller" output="screen"/>
+</launch>

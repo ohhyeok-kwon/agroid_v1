@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="damping_action_manager" exec="damping_action_manager_node" name="damping_action_manager" output="screen" respawn="true" respawn_delay="2.0"/>
+</launch>

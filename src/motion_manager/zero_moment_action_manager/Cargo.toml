@@ -1,0 +1,24 @@
+[package]
+name = "zero_moment_action_manager"
+version = "0.1.0"
+edition = "2021"
+description = "R1 zero moment action manager"
+publish = false
+
+[[bin]]
+name = "zero_moment_action_manager_node"
+path = "src/main.rs"
+
+[features]
+default = ["ros"]
+ros = []
+
+[dependencies]
+libc = "0.2"
+rclrs = "0.8"
+ros-env = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.ros]
+install_to_share = ["launch", "config"]

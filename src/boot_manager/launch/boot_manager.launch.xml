@@ -1,0 +1,7 @@
+<launch>
+  <include file="$(find-pkg-share humanoid_controller)/launch/humanoid_controller.launch.xml"/>
+  <include file="$(find-pkg-share remote_controller)/launch/remote_controller.launch.xml"/>
+  <include file="$(find-pkg-share safty_manager)/launch/safty_manager.launch.xml"/>
+  <include file="$(find-pkg-share state_manager)/launch/state_manager.launch.xml"/>
+  <node pkg="boot_manager" exec="boot_manager_node" name="boot_manager" output="screen"/>
+</launch>

@@ -1,0 +1,7 @@
+{
+  "manufacturer_state": "ZeroTorque",
+  "fsm_id": 0,
+  "update": "0x103538a0",
+  "joint_scope": "26 configured R1 joints; no unused SDK slots",
+  "values": "q=dq=tau=kp=kd=0"
+}

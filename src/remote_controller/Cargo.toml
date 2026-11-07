@@ -1,0 +1,20 @@
+[package]
+name = "remote_controller"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only R1 wireless remote input"
+publish = false
+
+[[bin]]
+name = "remote_controller_node"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+rclrs = "0.8"
+ros-env = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.ros]
+install_to_share = ["launch", "config"]

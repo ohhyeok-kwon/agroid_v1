@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="locked_standing_action_manager" exec="locked_standing_action_manager_node" name="locked_standing_action_manager" output="screen" respawn="true" respawn_delay="2.0"/>
+</launch>

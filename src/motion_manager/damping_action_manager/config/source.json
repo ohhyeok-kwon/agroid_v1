@@ -1,0 +1,7 @@
+{
+  "manufacturer_state": "Damping",
+  "fsm_id": 1,
+  "update": "0x1034e440",
+  "config": "fsm/statics/damping.yaml",
+  "values": "q=dq=tau=kp=0; kd=4.0 except head pitch/yaw=0.1"
+}

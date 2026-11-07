@@ -1,0 +1,24 @@
+{
+  "manufacturer_state": "AmpLocomotion",
+  "fsm_id": 811,
+  "entry_guard": "0x103a3a3c / 0x103a8df4",
+  "observations": "0x103a7920",
+  "policy_step": "0x103a7da8",
+  "command_filter": "0x103a4418 / 0x103a4784",
+  "policy_period_s": 0.02,
+  "runtime": "ONNX Runtime 1.18.1 API 18, manufacturer aarch64 library",
+  "models": {
+    "walk": {
+      "origin": "net/motions/amp_locomotion/2026-04-07_13-42-10/policy_42.5.onnx",
+      "sha256": "d6d81d37d8b47aa5b6e273e48b7fff560bdb876fc67cbdc28d985b8595a4365f"
+    },
+    "run": {
+      "origin": "net/motions/amp_locomotion/2026-04-07_13-24-17/policy_36k.onnx",
+      "sha256": "5ef87fcae57c6badb58e59da7980a289c77c2d33a004ce9ae0c622ae6c868d8f"
+    },
+    "turn": {
+      "origin": "net/motions/amp_locomotion/2026-04-03_09-11-48/policy_40k.onnx",
+      "sha256": "15abd0a8d48f1702e2dc232871b8684e1c81423cc9ffab258fa74bf51589e6d6"
+    }
+  }
+}

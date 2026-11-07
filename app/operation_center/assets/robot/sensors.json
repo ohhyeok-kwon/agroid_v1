@@ -1,0 +1,9 @@
+{
+  "source": "R1.urdf and camera_link.STL at the commit recorded in source.json",
+  "markers": [
+    { "id": "pelvis_imu", "label": "IMU · 골반", "kind": "imu", "link": "imu_in_pelvis_link", "position": [0, 0, 0], "side": "center" },
+    { "id": "left_camera", "label": "왼쪽 카메라", "kind": "camera", "link": "camera_link", "position": [0.0118, 0.03, 0], "side": "left" },
+    { "id": "right_camera", "label": "오른쪽 카메라", "kind": "camera", "link": "camera_link", "position": [0.0118, -0.03, 0], "side": "right" }
+  ],
+  "unlocated": ["메인보드 IMU · 위치 미확인"]
+}

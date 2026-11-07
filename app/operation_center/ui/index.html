@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Operation Center</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+<div class="app">
+  <header class="header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 2 8.5 5v10L12 22l-8.5-5V7Z M3.5 7 12 12l8.5-5 M12 12v10"/></svg></span>Operation Center</div>
+    <span class="header-divider"></span>
+    <nav class="tabs" role="tablist" aria-label="앱 화면"><button id="status-tab" role="tab" aria-selected="true" aria-controls="status-panel">Status</button></nav>
+    <div class="header-end">
+      <span class="robot-label">UNITREE R1</span>
+      <span id="connection-badge" class="badge" data-state="disconnected" role="status" aria-live="polite"><span class="connection-state-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path id="connection-state-mark" d="M4 8h8"/></svg></span><span id="connection-label">연결 안 됨</span></span>
+      <div class="connection-actions">
+        <button id="connect-button" class="primary" type="submit" form="connect-form"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 2v4m6-4v4M5 6h10v3a5 5 0 0 1-10 0V6Zm5 8v4"/></svg><span id="connect-caption">로봇 연결</span></button>
+        <button id="disconnect-button" class="secondary" type="button" hidden>연결 끊기</button>
+      </div>
+    </div>
+  </header>
+  <main id="status-panel" role="tabpanel" aria-labelledby="status-tab">
+    <aside class="sidebar">
+      <div class="sidebar-heading"><span class="eyebrow">ROBOT STATUS</span><h1>로봇 상태</h1><p>현재 자세를 한눈에 확인하세요.</p></div>
+      <section class="section">
+        <h2>연결</h2>
+        <form id="connect-form">
+          <label for="robot-host">로봇 IP 주소</label>
+          <div class="host-input"><span aria-hidden="true">⌁</span><input id="robot-host" name="host" placeholder="192.168.45.244" autocomplete="off" spellcheck="false" required aria-describedby="connection-message"></div>
+        </form>
+        <p id="connection-message" class="connection-message" role="status" aria-live="polite">로봇을 연결하면 현재 관절 자세를 표시합니다.</p>
+      </section>
+      <section class="section">
+        <div class="section-title"><h2>자세 수신</h2><span id="telemetry-dot" class="telemetry-dot" aria-hidden="true"></span></div>
+        <dl class="metrics"><div><dt>수신 주기</dt><dd id="rate">—<small> Hz</small></dd></div><div><dt>마지막 수신</dt><dd id="age">—</dd></div></dl>
+        <div class="orientation"><div><span>Roll</span><strong id="roll">—</strong></div><div><span>Pitch</span><strong id="pitch">—</strong></div><div><span>Yaw</span><strong id="yaw">—</strong></div></div>
+      </section>
+      <section class="section">
+        <h2>화면 표시</h2>
+        <label class="toggle"><span>바닥 그리드</span><input id="show-grid" type="checkbox" checked><span class="switch" aria-hidden="true"></span></label>
+        <label class="toggle" title="관절·IMU·카메라 위치를 함께 표시합니다"><span>관절 위치</span><input id="show-joints" type="checkbox"><span class="switch" aria-hidden="true"></span></label>
+      </section>
+      <section class="section joint-section">
+        <details id="joint-details"><summary>관절 자세 <span class="count">26</span><span class="chevron">⌄</span></summary><div id="joint-values" class="joint-values"></div></details>
+      </section>
+      <div class="sidebar-footer"><span class="footer-mark"></span><div><strong>ROS 2 상태 모니터링</strong><p>로봇 동작은 제어하지 않습니다.</p></div></div>
+    </aside>
+    <section class="viewport" aria-label="R1 3D 로봇 자세">
+      <canvas id="robot-view" aria-label="드래그로 회전하고 스크롤로 확대할 수 있는 R1 모델" tabindex="0"></canvas>
+      <div class="viewport-heading"><span class="eyebrow">ROBOT VIEW</span><div><h2>Unitree R1</h2><span class="dof">26 DOF</span></div></div>
+      <div class="view-toolbar" role="group" aria-label="3D 시점"><button id="view-perspective" class="active" aria-pressed="true" title="입체 시점">입체</button><button id="view-front" aria-pressed="false" title="정면 시점">정면</button><button id="view-side" aria-pressed="false" title="측면 시점">측면</button><span></span><button id="view-reset" class="reset-view" title="기본 시점으로 복원" aria-label="기본 시점으로 복원"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 7a6.5 6.5 0 1 1 0 6M4 3v4h4"/></svg></button></div>
+      <div id="model-loading" class="model-loading" role="status"><span class="spinner"></span><span id="loading-message">로봇 모델 불러오는 중</span></div>
+      <div id="pose-indicator" class="pose-indicator"><span class="pose-dot"></span><span id="pose-label">기준 모델 · 실제 자세 미수신</span></div>
+      <div class="view-help"><span><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="2" width="10" height="16" rx="5"/><path d="M10 2v6"/></svg>드래그 회전</span><i></i><span>스크롤 확대</span><i></i><span>우클릭 이동</span></div>
+      <div class="axis-legend" aria-label="좌표축: X 전방, Y 좌측, Z 위"><span class="axis-z">Z</span><span class="axis-y">Y</span><span class="axis-x">X</span><svg viewBox="0 0 66 64" aria-hidden="true"><path class="axis-z" d="M33 39V11"/><path class="axis-y" d="M33 39 10 51"/><path class="axis-x" d="m33 39 23 12"/></svg></div>
+    </section>
+  </main>
+  <footer class="statusbar"><div><span id="footer-status-dot"></span><span id="footer-status">실제 자세 수신 대기</span></div><span>AGROID<span class="statusbar-separator">/</span>OPERATION CENTER</span></footer>
+</div>
+</body>
+</html>

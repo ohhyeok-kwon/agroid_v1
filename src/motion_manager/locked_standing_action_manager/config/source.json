@@ -1,0 +1,11 @@
+{
+  "manufacturer_state": "Stance (4) through MoveTo (6), not Keep (5)",
+  "config": "fsm/statics/stance.yaml",
+  "entry_guard": "0x10356118",
+  "stance_update": "0x10356588",
+  "move_to_enter": "0x1037ce48",
+  "move_to_update": "0x1037d404",
+  "mapping": "stance joint_idx order mapped to 26 URDF joint names in package-local motion::profile",
+  "transition": "T=max(abs(target-start))/1.0; q linear; dq=tau=0",
+  "physical_validation": false
+}

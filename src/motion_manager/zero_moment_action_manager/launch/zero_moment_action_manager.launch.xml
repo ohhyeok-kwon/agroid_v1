@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="zero_moment_action_manager" exec="zero_moment_action_manager_node" name="zero_moment_action_manager" output="screen" respawn="true" respawn_delay="2.0"/>
+</launch>

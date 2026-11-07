@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>locked_standing_action_manager</name>
+  <version>0.1.0</version>
+  <description>R1 joint-space locked standing action manager.</description>
+  <maintainer email="ohkwon@daedong.co.kr">jimmy</maintainer>
+  <license>Proprietary</license>
+  <depend>rclrs</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>launch_xml</exec_depend>
+  <export><build_type>ament_cargo</build_type></export>
+</package>

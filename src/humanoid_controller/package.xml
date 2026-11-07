@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>humanoid_controller</name>
+  <version>0.1.0</version>
+  <description>R1 USB status exchange and hardware state decoding.</description>
+  <maintainer email="ohkwon@daedong.co.kr">jimmy</maintainer>
+  <license>Proprietary</license>
+  <depend>rclrs</depend>
+  <depend>fastdds</depend>
+  <depend>std_msgs</depend>
+  <depend>humanoid_controller_msg</depend>
+  <depend>openssl</depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>launch_xml</exec_depend>
+  <export><build_type>ament_cargo</build_type></export>
+</package>

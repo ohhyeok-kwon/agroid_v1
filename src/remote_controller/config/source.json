@@ -1,0 +1,11 @@
+{
+  "manufacturer_image_sha256": "9fb845b265bcaa26255290e2e5b197e97bd39cb2ae15da491b4000b6d54c6df5",
+  "native_general_receiver": "0x10192460; CRC32 of 39 little-endian words at object+0xb330",
+  "native_rf_receiver": "0x101918c0; object+0xb398, 10-byte fragments and index at byte 10",
+  "native_header_table": "starts at object+0x62ba, RF index 1 => object+0x62bc = 55 51",
+  "native_rf_packet": "40 bytes, sum bytes 2..37 as big-endian u16 at bytes 38..39",
+  "sdk_mapping": "https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/unitree_sdk2py/utils/joystick.py",
+  "axis_offsets": {"lx": 4, "rx": 8, "ry": 12, "reserved": 16, "ly": 20},
+  "joy_axes": ["lx", "ly", "rx", "ry"],
+  "joy_buttons": ["R1", "L1", "start", "select", "R2", "L2", "F1", "F2", "A", "B", "X", "Y", "up", "right", "down", "left"]
+}
