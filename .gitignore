@@ -18,7 +18,7 @@ temp/
 *.rej
 *~
 
-# Shared exclusions for Git and scripts/00_initialize.sh (no ! patterns).
+# Git exclusions. R1 deployment packages runtime artifacts explicitly.
 .env
 .env.*
 .venv/
@@ -48,3 +48,5 @@ logs/
 __pycache__/
 *.py[cod]
 /app/operation_center/gen
+# MuJoCo writes its warnings into the directory a tool was started in.
+MUJOCO_LOG.TXT

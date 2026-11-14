@@ -9,7 +9,8 @@ use crate::{
 mod hardware;
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, RclrsErrorFilter, SpinOptions};
 use ros_env::{
-    humanoid_controller_msg::msg::LowState, sensor_msgs::msg::Joy, std_msgs::msg::String as RosString,
+    humanoid_controller_msg::msg::LowState, sensor_msgs::msg::Joy,
+    std_msgs::msg::String as RosString,
 };
 use serde_json::json;
 use std::{

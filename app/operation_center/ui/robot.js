@@ -97,7 +97,7 @@ export class RobotView {
       this.animation = requestAnimationFrame(this.frame);
     };
     this.frame();
-    canvas.addEventListener('dblclick', () => this.preset('perspective'));
+    canvas.addEventListener('dblclick', () => { if (!this.rightDragOnly) this.preset('perspective'); });
     this.contextLost = (event) => { event.preventDefault(); cancelAnimationFrame(this.animation); };
     canvas.addEventListener('webglcontextlost', this.contextLost);
     canvas.addEventListener('webglcontextrestored', () => { this.dirty = true; this.frame(); });
@@ -109,6 +109,35 @@ export class RobotView {
     this.controls.target.fromArray(positions[name] ? [0, 0, .66] : startup.view.target);
     this.controls.update();
     this.dirty = true;
+  }
+
+  rightDragLook() {
+    if (this.rightDragOnly) return;
+    this.rightDragOnly = true;
+    this.controls.mouseButtons = { LEFT: null, MIDDLE: null, RIGHT: THREE.MOUSE.ROTATE };
+    this.controls.enableDamping = false;
+    this.controls.enablePan = false;
+    this.canvas.classList.add('right-drag-look');
+    this.rightDragStart = (event) => { if (event.button === 2) this.canvas.classList.add('looking'); };
+    this.rightDragEnd = () => this.canvas.classList.remove('looking');
+    this.canvas.addEventListener('pointerdown', this.rightDragStart);
+    window.addEventListener('pointerup', this.rightDragEnd);
+  }
+
+  terrain(objects) {
+    if (this.obstacles) {
+      this.obstacles.traverse((item) => { item.geometry?.dispose(); item.material?.dispose(); });
+      this.scene.remove(this.obstacles);
+    }
+    this.obstacles = new THREE.Group();
+    for (const item of objects) {
+      const geometry = item.shape === 'box' ? new THREE.BoxGeometry(...item.size.map((v) => v * 2)) : new THREE.SphereGeometry(1, 18, 12);
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: item.color, roughness: .95 }));
+      if (item.shape !== 'box') mesh.scale.fromArray(item.size);
+      mesh.position.fromArray(item.position); mesh.rotation.z = item.yaw;
+      mesh.castShadow = mesh.receiveShadow = true; this.obstacles.add(mesh);
+    }
+    this.scene.add(this.obstacles); this.dirty = true;
   }
 
   async load() {
@@ -193,7 +222,7 @@ export class RobotView {
     return [...this.joints.keys()];
   }
 
-  setPose(pose) {
+  setPose(pose, { follow = false } = {}) {
     const angle = new THREE.Quaternion();
     for (const [name, joint] of this.joints) {
       const transform = pose?.transforms?.[joint.child];
@@ -209,11 +238,21 @@ export class RobotView {
     const q = pose?.quaternion;
     if (q) this.model.quaternion.set(q[1], q[2], q[3], q[0]);
     else this.model.quaternion.identity();
-    // Position is a display anchor, not a measured world translation.
-    this.model.position.z = 0;
-    this.model.updateMatrixWorld(true);
-    this.bounds.setFromObject(this.model);
-    this.model.position.z = -this.bounds.min.z;
+    if (pose?.position) {
+      this.model.position.fromArray(pose.position);
+      if (follow) {
+        const target = this.model.position.clone();
+        const shift = target.clone().sub(this.controls.target);
+        this.camera.position.add(shift);
+        this.controls.target.copy(target);
+      }
+    } else {
+      // Live TF has no world position; anchor that display to the floor.
+      this.model.position.set(0, 0, 0);
+      this.model.updateMatrixWorld(true);
+      this.bounds.setFromObject(this.model);
+      this.model.position.z = -this.bounds.min.z;
+    }
     this.model.updateMatrixWorld(true);
     for (const [pivot, marker] of this.markerPairs) pivot.getWorldPosition(marker.position);
     for (const { link, marker, offset } of this.sensorPairs) {
@@ -235,6 +274,8 @@ export class RobotView {
     cancelAnimationFrame(this.animation);
     this.resize.disconnect();
     this.controls.dispose();
+    this.canvas.removeEventListener('pointerdown', this.rightDragStart);
+    window.removeEventListener('pointerup', this.rightDragEnd);
     this.labels.domElement.remove();
     this.sensorNote.remove();
     this.scene.traverse((object) => {

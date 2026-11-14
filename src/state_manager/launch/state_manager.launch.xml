@@ -3,5 +3,7 @@
   <include file="$(find-pkg-share damping_action_manager)/launch/damping_action_manager.launch.xml"/>
   <include file="$(find-pkg-share locked_standing_action_manager)/launch/locked_standing_action_manager.launch.xml"/>
   <include file="$(find-pkg-share walking_action_manager)/launch/walking_action_manager.launch.xml"/>
+  <include file="$(find-pkg-share careful_walk_action_manager)/launch/careful_walk_action_manager.launch.xml"/>
+  <include file="$(find-pkg-share safe_crouch_action_manager)/launch/safe_crouch_action_manager.launch.xml"/>
   <node pkg="state_manager" exec="state_manager_node" name="state_manager" output="screen" respawn="true" respawn_delay="2.0"/>
 </launch>

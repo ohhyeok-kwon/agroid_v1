@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>safe_crouch_action_manager</name><version>0.1.0</version>
+  <description>Learned protective crouching action with slow height commands.</description>
+  <maintainer email="ohkwon@daedong.co.kr">jimmy</maintainer><license>Proprietary</license>
+  <depend>walking_action_manager</depend><depend>std_msgs</depend><depend>sensor_msgs</depend><depend>humanoid_controller_msg</depend>
+  <exec_depend>launch_ros</exec_depend><exec_depend>launch_xml</exec_depend>
+  <export><build_type>ament_cargo</build_type></export>
+</package>

@@ -1,6 +1,6 @@
 # 패키지
 
-실행 노드 9개는 Rust ament_cargo다. humanoid_controller_msg는 메시지 생성용 ament_cmake다.
+실행 노드 11개는 Rust ament_cargo다. humanoid_controller_msg는 메시지 생성용 ament_cmake다.
 
 | 패키지 | 역할 |
 |---|---|
@@ -14,19 +14,20 @@
 | damping_action_manager | Damping(1): kp=0, kd=4; 머리 kd=0.1 |
 | locked_standing_action_manager | MoveTo(6) → Stance(4), 최대 0.1rad/s로 기립·유지 |
 | walking_action_manager | AmpLocomotion(811): 제조사 모델·IMU·조이스틱으로 50Hz 관절 목표 계산 |
+| careful_walk_action_manager | CarefulWalk(812): 확정 조심 보행 정책, 8방향·회전·정지. `careful_walk.json`에 `command` 블록(학생 계약 v2: 한계·tick당 변화량·IMU 방향 유지)이 있으면 그 계약으로 명령 처리 |
+| safe_crouch_action_manager | SafeCrouch(813): 확정 웅크리기 정책, 높이 명령을 천천히 낮춰 유지 |
 
 모션 경로: action → state_manager(`/lowcmd`) → safty_manager(`/safty_manager/lowcmd`) → controller → USB.
 통과한 LowCmd의 필드·CRC는 바꾸지 않으며 과거 명령을 재송신하지 않는다.
 동작 계산은 action, 선택은 state_manager, 안전 판정은 safty_manager, 장치 제어는 controller가 담당한다.
 동작 계약은 `state_manager/src/motion/`를 참조한다. 별도 common 패키지는 없다.
-
 safty_manager의 `layers/`는 command_format·joint_range·sudden_motion·speed·boot_status·feedback으로 나뉜다.
 현재 모든 안전 레이어 OFF: 명령을 그대로 전달한다. 활성화 시 201은 동작 유지, 202는 차단·기립 요청이다. [판정 기준](05_dtc.md).
 state_manager는 최신 완전한 관절 측정으로 기립을 생성하고, safty_manager는 해당 목표 ID·controller 세션을 확인한다.
 센서·통신 오류가 남아 있어도 유효한 기립 명령은 전달한다. 범위·급변·속도 검사는 기립 명령에도 적용한다.
 복구 후에도 기립을 유지한다. L2+B 감쇠는 우선하며, 전원·USB·모터 장애에서는 자세 유지를 보장하지 않는다.
 설정: [safty_manager/config/default.yaml](../src/safty_manager/config/default.yaml). 각 검사와 warning/fault의 `enable`을 지정한다.
-설정 변경은 safty_manager 재시작 시 적용된다. 다른 파일은 `AGROID_SAFTY_CONFIG`로 지정한다.
+설정은 PC 원본 수정 후 다시 배포한다. 다른 설정 파일은 `AGROID_SAFTY_CONFIG`로 지정한다.
 느린 기립 속도: [stance.json](../src/motion_manager/locked_standing_action_manager/config/stance.json)의 `joint_velocity_limit_rad_s`.
 
 | controller 모듈 | 역할 |
@@ -42,5 +43,8 @@ state_manager는 최신 완전한 관절 측정으로 기립을 생성하고, sa
 
 부팅은 zero_moment다. 보행은 기립 완료 후 R2+A, 스틱 중립 후 L2+↑로 기립 복귀한다.
 보행 오류·원본 기울기 초과·명령 중단의 기존 감쇠 동작은 유지한다. DDS는 [통신 설정](04_dds.md)을 따른다.
-R1 빌드: `./scripts/03_build.sh`. `--restart`는 빌드 후 서비스와 머리 초기화를 다시 실행한다.
-메시지 생성용 CMake ≥3.20은 빌드 스크립트가 준비한다. 테스트·임시 자료는 `.agent/`에 둔다.
+PC에서 `./scripts/03_deploy.sh`로 `src/`의 패키지를 자동 탐색해 모두 ARM64 Release 빌드한다. [옵션·검증·백업](01_initial_setup.md).
+새 패키지는 배포 스크립트 수정 없이 포함된다. 새 노드의 자동 실행은 해당 런치 파일을 부팅 런치에 연결해야 한다.
+R1 런타임은 `/root/workspace/agroid_v1/current/install/`이다. 바이너리·필수 설정만 배포하며 소스는 두지 않는다.
+파일 내용·권한이 달라진 경우만 `boot_manager.service`를 재시작한다. 같은 배포는 기존 프로세스를 유지한다.
+크로스 도구·R1 sysroot는 `.agent/ros2/lyrical-cross/`, 빌드·배포 묶음은 `.agent/deploy/`에 둔다.

@@ -34,6 +34,8 @@ pub enum Action {
     Damping,
     LockedStanding,
     Walking,
+    CarefulWalk,
+    SafeCrouch,
 }
 
 impl Action {
@@ -43,6 +45,8 @@ impl Action {
             Self::Damping => 1,
             Self::LockedStanding => 4,
             Self::Walking => 811,
+            Self::CarefulWalk => 812,
+            Self::SafeCrouch => 813,
         }
     }
 }

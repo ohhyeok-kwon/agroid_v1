@@ -1,4 +1,6 @@
 import { RobotView } from './robot.js';
+import { TrainerPanel } from './trainer.js';
+import { SimulationPanel } from './simulation.js';
 
 const $ = (id) => document.getElementById(id);
 const labels = { disconnected: '연결 안 됨', connecting: '연결 중', connected: '연결됨', stale: '수신 중단', error: '연결 실패' };
@@ -132,4 +134,35 @@ async function initializeView() {
 }
 initializeView();
 poll();
-window.addEventListener('pagehide', () => { stopped = true; view?.destroy(); });
+const trainer = new TrainerPanel();
+const simulation = new SimulationPanel(() => selectTab($('trainer-tab')));
+const tabs = [...document.querySelectorAll('[role=tab]')];
+function selectTab(tab) {
+  for (const item of tabs) {
+    const selected = item === tab;
+    item.setAttribute('aria-selected', String(selected));
+    item.tabIndex = selected ? 0 : -1;
+    $(item.getAttribute('aria-controls')).hidden = !selected;
+  }
+  const simulating = tab.id === 'simulation-tab';
+  const training = tab.id === 'trainer-tab';
+  $('robot-header').hidden = $('status-footer').hidden = simulating || training;
+  $('simulation-header').hidden = $('simulation-footer').hidden = !simulating;
+  $('trainer-header').hidden = $('trainer-footer').hidden = !training;
+  simulation.setVisible(simulating);
+  trainer.setVisible(training);
+  history.replaceState(null, '', simulating ? '#simulation' : training ? '#trainer' : '#status');
+}
+tabs.forEach((tab, index) => {
+  tab.addEventListener('click', () => selectTab(tab));
+  tab.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next].focus(); selectTab(tabs[next]);
+  });
+});
+const initialHash = location.hash;
+if (initialHash === '#simulation') selectTab($('simulation-tab'));
+if (initialHash === '#trainer') selectTab($('trainer-tab'));
+window.addEventListener('pagehide', () => { stopped = true; view?.destroy(); trainer.destroy(); simulation.destroy(); });

@@ -912,31 +912,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "damping_action_manager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "humanoid_controller"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "locked_standing_action_manager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "remote_controller"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "state_manager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "walking_action_manager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "zero_moment_action_manager"
-version = "0.1.0"

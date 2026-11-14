@@ -11,7 +11,7 @@ for oc_arg in "$@"; do
         --headless) oc_mode=headless ;;
         --build-only) oc_mode=build ;;
         --help|-h)
-            printf 'Usage: %s [--headless [--port PORT] | --build-only]\n' "$0"
+            printf 'Usage: %s [--headless [--port PORT] [--with-results] | --build-only]\n' "$0"
             exit 0 ;;
         *) oc_args+=("$oc_arg") ;;
     esac

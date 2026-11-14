@@ -1,0 +1,21 @@
+[package]
+name = "careful_walk_action_manager"
+version = "0.1.0"
+edition = "2021"
+description = "R1 careful walking policy action"
+publish = false
+
+[[bin]]
+name = "careful_walk_action_manager_node"
+path = "src/main.rs"
+
+[features]
+default = ["ros"]
+ros = ["walking_action_manager/ros"]
+
+[dependencies]
+walking_action_manager = { path = "../walking_action_manager", default-features = false }
+serde_json = "1"
+
+[package.metadata.ros]
+install_to_share = ["launch", "config"]

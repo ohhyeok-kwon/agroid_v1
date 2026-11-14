@@ -14,7 +14,7 @@ use state_manager::{
     ankle::AnkleMap,
     joints::{is_repeat, MotorStatus, NAMES},
     model::{Model, Transform, URDF},
-    motion::{mono_ms, now_ms, GOAL_TOPIC, RESULT_TOPIC},
+    motion::{mono_ms, now_ms, Action, GOAL_TOPIC, RESULT_TOPIC},
     remote_keys::{action_for, RemoteKeys},
     Manager,
 };
@@ -214,6 +214,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "/walking_status".keep_last(1).reliable().transient_local(),
         move |message: RosString| input.lock().unwrap().receive_walking(&message.data),
     )?;
+    let mut _learned_policies = Vec::new();
+    for (topic, action) in [
+        ("/careful_walk_status", Action::CarefulWalk),
+        ("/safe_crouch_status", Action::SafeCrouch),
+    ] {
+        let input = Arc::clone(&manager);
+        _learned_policies.push(node.create_subscription::<RosString, _>(
+            topic.keep_last(1).reliable().transient_local(),
+            move |message: RosString| input.lock().unwrap().receive_policy(action, &message.data),
+        )?);
+    }
     let input = Arc::clone(&manager);
     let _requests = node.create_subscription::<RosString, _>(
         "/humanoid_state/request".keep_last(1).reliable(),

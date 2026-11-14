@@ -20,6 +20,7 @@ class Telemetry:
         self.worker = None
         self.process = None
         self.cancel = threading.Event()
+        self.closed = False
         self.host = self.saved_host()
         self.status = 'disconnected'
         self.message = '로봇을 연결하면 현재 관절 자세를 표시합니다.'
@@ -92,6 +93,8 @@ class Telemetry:
     def connect(self, host):
         host = str(ipaddress.IPv4Address(host))
         with self.operations:
+            if self.closed:
+                raise ValueError('종료된 Operation Center에는 연결할 수 없습니다.')
             if self.host == host and self.worker and self.worker.is_alive():
                 return
             self._stop()
@@ -102,6 +105,10 @@ class Telemetry:
             self.update('connecting', 'R1 ROS 2 수신을 준비하는 중입니다.')
             self.worker = threading.Thread(target=self._read, args=(host,), daemon=True)
             self.worker.start()
+
+    def close(self):
+        self.closed = True
+        self.disconnect()
 
     def _read(self, host):
         process = None

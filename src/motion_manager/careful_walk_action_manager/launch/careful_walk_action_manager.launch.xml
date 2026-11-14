@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="careful_walk_action_manager" exec="careful_walk_action_manager_node" name="careful_walk_action_manager" output="screen" respawn="true" respawn_delay="2.0"/>
+</launch>

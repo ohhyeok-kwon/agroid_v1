@@ -1,0 +1,6 @@
+{
+  "source": "trainer/actions/safe_crouch/safe_crouch.onnx",
+  "sha256": "7df21319b1c52594cdb1b8784a4044ebd020737d2ec003c66167f7ff92848481",
+  "input": "obs [1,810]",
+  "output": "actions [1,24]"
+}

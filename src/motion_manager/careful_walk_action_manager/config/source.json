@@ -1,0 +1,6 @@
+{
+  "source": "trainer/actions/careful_walk/careful_walk.onnx",
+  "sha256": "59279d3760026db97b9509e91e9dde33d9b33c95166535f7ae08c8b781920708",
+  "input": "obs [1,810]",
+  "output": "actions [1,24]"
+}

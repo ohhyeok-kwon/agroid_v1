@@ -284,9 +284,9 @@ class Installer:
             candidate.write_text(unit)
             command('systemd-analyze', '--man=no', 'verify', str(candidate))
 
-    def install(self, unit, start=True):
+    def install(self, unit, start=True, force_restart=False):
         current = self.inspect()
-        if self.desired(current, unit, start):
+        if self.desired(current, unit, start) and not force_restart:
             # A missing/stale original snapshot is never a reason to restart.
             if self.pending.exists():
                 try:
@@ -316,7 +316,7 @@ class Installer:
                     self.ctl('disable', SERVICE)
                 self.ctl('enable', SERVICE)
             if start:
-                if current['active'] and (changed or not self.desired(current, unit, True)):
+                if current['active'] and (force_restart or changed or not self.desired(current, unit, True)):
                     self.ctl('restart', SERVICE)
                 elif not current['active']:
                     # 이전 시작 제한(failed)만 해제합니다. systemd 245는 아직 로드되지 않은 유닛이면 거부하므로 결과를 무시합니다.
@@ -365,7 +365,10 @@ def main(argv=None):
     mode.add_argument('--dry-run', action='store_true', help='현재 상태와 적용 계획만 확인')
     mode.add_argument('--restore', action='store_true', help='최초 설치 전 서비스 상태로 복원')
     parser.add_argument('--no-start', action='store_true', help='부팅 자동 실행만 등록; 현재 프로세스는 유지')
+    parser.add_argument('--restart', action='store_true', help='런타임 파일 변경 시 현재 서비스도 재시작')
     args = parser.parse_args(argv)
+    if args.restart and args.no_start:
+        parser.error('--restart와 --no-start는 함께 사용할 수 없습니다.')
     unit = render_unit(PROJECT)
     if args.print_unit:
         print(unit, end='')
@@ -392,7 +395,7 @@ def main(argv=None):
         if args.restore:
             installer.restore()
         else:
-            installer.install(unit, start=not args.no_start)
+            installer.install(unit, start=not args.no_start, force_restart=args.restart)
     return 0
 
 

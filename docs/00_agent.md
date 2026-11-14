@@ -13,7 +13,7 @@
 | 파일 | 용도 |
 |---|---|
 | `00_agent.md` | 문서 작성 기준·파일별 책임·공통 작업 규칙 |
-| [01_initial_setup.md](01_initial_setup.md) | R1 연결·동기화·최초 실행에 필요한 현재 명령 |
+| [01_initial_setup.md](01_initial_setup.md) | R1 연결·PC 빌드·배포에 필요한 현재 명령 |
 | [02_operation_center.md](02_operation_center.md) | 운영 화면 실행·사용법·지원 범위 |
 | [03_packages.md](03_packages.md) | 패키지 역할·구조·빌드·런치 방법 |
 | [04_dds.md](04_dds.md) | DDS 구현·도메인·통신 설정 |
@@ -24,11 +24,14 @@
 | [09_motor.md](09_motor.md) | 모터 제조사·모델 확인 범위·공개 스펙·제어 기능 |
 | [10_motor_protocol.md](10_motor_protocol.md) | 모터 송수신 바이트·CRC·단위 변환·현재 적용 범위 |
 | [11_sensors.md](11_sensors.md) | 장착 IMU 구분·수신 경로·필드·단위·현재 사용 범위 |
+| [12_train.md](12_train.md) | 학습 정책 계약·액션별 명령·로봇 적용·배포 |
 
-- R1 연결은 `scripts/00_initialize.sh`, 셸은 `scripts/02_connect_ssh.sh`를 사용한다.
-- R1 빌드는 `scripts/03_build.sh`로 수행한다.
-- 임시 파일·검증 근거는 `.agent/`에 둔다. `scripts/`에는 멱등한 공용 도구만 둔다.
+- R1 연결은 `scripts/00_initialize.sh`, 최신 배포본 셸은 `scripts/02_connect_ssh.sh`를 사용한다.
+- PC 크로스 빌드·R1 배포는 `scripts/03_deploy.sh`로 수행한다. 파일 내용·권한이 달라질 때만 서비스를 재시작한다.
+- R1에는 실행 파일·필수 설정만 둔다. 소스·trainer·빌드 도구를 동기화하거나 R1에서 빌드하지 않는다.
+- 소스와 무관한 에이전트 지침·메모·임시 파일·검증 근거는 `.agent/`에 둔다. `scripts/`에는 멱등한 공용 도구만 둔다.
 - 테스트 코드·데이터·mock·fixture·임시 산출물은 모두 `.agent/`에 둔다. 루트·패키지 안에 `tests/`를 만들지 않는다.
 - Git에 들어가는 소스 코드는 실제 구현만 포함한다. 테스트·임시 파일은 추적 해제하고 `.gitignore`로 제외한다.
 - 상태·동작 로직은 각 패키지 내부에 둔다. 별도 common 패키지를 만들지 않는다.
 - `src/`에는 실제 실행 구현·런치·설정만 둔다.
+- 자연어 학습 실행 요청의 완료 조건은 [.agent/AGENTS.md](../.agent/AGENTS.md)를 따른다. 서버 실행 후 Operation Center 조회 검증까지 포함한다.

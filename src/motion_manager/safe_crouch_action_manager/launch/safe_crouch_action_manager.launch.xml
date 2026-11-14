@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="safe_crouch_action_manager" exec="safe_crouch_action_manager_node" name="safe_crouch_action_manager" output="screen" respawn="true" respawn_delay="2.0"/>
+</launch>

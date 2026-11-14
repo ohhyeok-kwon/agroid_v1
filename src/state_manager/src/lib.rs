@@ -64,6 +64,8 @@ pub struct Manager {
     motor: Option<(u64, MotorHealth)>,
     remote: Option<(u64, RemoteHealth)>,
     walking: Option<WalkingHealth>,
+    careful_walk: Option<WalkingHealth>,
+    safe_crouch: Option<WalkingHealth>,
     joints: Option<(u64, [f64; 26])>,
     goal: Option<Goal>,
     result: Option<(u64, u64, ActionPhase)>,
@@ -86,6 +88,8 @@ impl Manager {
             motor: None,
             remote: None,
             walking: None,
+            careful_walk: None,
+            safe_crouch: None,
             joints: None,
             goal: None,
             result: None,
@@ -110,6 +114,13 @@ impl Manager {
     }
     pub fn receive_walking(&mut self, text: &str) {
         self.walking = serde_json::from_str(text).ok();
+    }
+    pub fn receive_policy(&mut self, action: Action, text: &str) {
+        match action {
+            Action::CarefulWalk => self.careful_walk = serde_json::from_str(text).ok(),
+            Action::SafeCrouch => self.safe_crouch = serde_json::from_str(text).ok(),
+            _ => {}
+        }
     }
     /// The native planner starts from the latest complete measured joint positions.
     pub fn receive_joints(&mut self, positions: &[Option<f64>; 26], measured: u64) {
@@ -201,11 +212,12 @@ impl Manager {
             match request.action {
                 Action::Walking => {
                     self.motors_ready(now)?;
-                    if current != Some(Action::LockedStanding)
-                        || self
-                            .result
-                            .as_ref()
-                            .is_none_or(|(_, _, phase)| *phase != ActionPhase::Holding)
+                    if current != Some(Action::CarefulWalk)
+                        && (current != Some(Action::LockedStanding)
+                            || self
+                                .result
+                                .as_ref()
+                                .is_none_or(|(_, _, phase)| *phase != ActionPhase::Holding))
                     {
                         return Err("walking starts from completed locked standing".into());
                     }
@@ -217,14 +229,42 @@ impl Manager {
                         return Err(walking.message.clone());
                     }
                 }
+                Action::CarefulWalk | Action::SafeCrouch => {
+                    self.motors_ready(now)?;
+                    if request.action == Action::CarefulWalk
+                        && current != Some(Action::Walking)
+                        && (current != Some(Action::LockedStanding)
+                            || self
+                                .result
+                                .as_ref()
+                                .is_none_or(|(_, _, phase)| *phase != ActionPhase::Holding))
+                    {
+                        return Err(
+                            "careful walking starts from walking or completed standing".into()
+                        );
+                    }
+                    let health = if request.action == Action::CarefulWalk {
+                        &self.careful_walk
+                    } else {
+                        &self.safe_crouch
+                    };
+                    let health = health
+                        .as_ref()
+                        .ok_or("waiting for learned action manager")?;
+                    if !health.ready {
+                        return Err(health.message.clone());
+                    }
+                }
                 Action::Damping => self.motor_link(now)?,
                 Action::ZeroMoment => {
                     self.motor_link(now)?;
                 }
                 Action::LockedStanding => {
                     self.motors_ready(now)?;
-                    if current == Some(Action::Walking)
-                        && self.walking.as_ref().is_some_and(|w| w.moving)
+                    if (current == Some(Action::Walking)
+                        && self.walking.as_ref().is_some_and(|w| w.moving))
+                        || (current == Some(Action::CarefulWalk)
+                            && self.careful_walk.as_ref().is_some_and(|w| w.moving))
                     {
                         return Err(
                             "native walking exit: release the joystick before standing".into()
@@ -299,7 +339,10 @@ impl Manager {
         }
         self.apply_safety(now);
         if self.safety.is_none()
-            && self.selected_action() == Some(Action::Walking)
+            && matches!(
+                self.selected_action(),
+                Some(Action::Walking | Action::CarefulWalk | Action::SafeCrouch)
+            )
             && self
                 .motor
                 .as_ref()
@@ -311,7 +354,10 @@ impl Manager {
     }
 
     fn action_failed(&mut self, reason: String, now: u64) {
-        if self.selected_action() == Some(Action::Walking) {
+        if matches!(
+            self.selected_action(),
+            Some(Action::Walking | Action::CarefulWalk | Action::SafeCrouch)
+        ) {
             let _ = self.activate(Action::Damping, now);
             self.control_source = "walking_failure";
             self.last_request =
@@ -422,7 +468,9 @@ impl Manager {
             })),
             "last_request": self.last_request,
             "actions": {"zero_moment": true, "damping": true, "locked_standing": true,
-                "walking": self.walking.as_ref().is_some_and(|w|w.ready)}
+                "walking": self.walking.as_ref().is_some_and(|w|w.ready),
+                "careful_walk":self.careful_walk.as_ref().is_some_and(|w|w.ready),
+                "safe_crouch":self.safe_crouch.as_ref().is_some_and(|w|w.ready)}
         })
     }
 }

@@ -27,7 +27,7 @@ usage() {
 
 /opt/ros/<배포판>/setup.bash와 이 프로젝트의 install/local_setup.bash를 불러온 뒤 실행합니다.
 --check는 ROS 환경·설치된 패키지 확인만 하고 실행하지 않습니다.
-최초 준비: ./scripts/03_build.sh 후 sudo ./scripts/daemon/00_add_humanoid_service.sh
+최초 준비: PC에서 ./scripts/03_deploy.sh로 빌드·배포·서비스 등록
 ROS_DISTRO가 없으면 /opt/ros 아래 setup.bash가 있는 단일 배포판을 선택합니다.
 USAGE
 }
@@ -76,16 +76,34 @@ set -u
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 export ROS_LOG_DIR="$project_dir/log/bringup"
 
-# 외부 설치본으로 우연히 성공하지 않도록 패키지 출처를 확인합니다.
-for package in boot_manager humanoid_controller remote_controller safty_manager \
-    state_manager zero_moment_action_manager damping_action_manager \
-    locked_standing_action_manager walking_action_manager; do
+# 새 패키지도 검사하도록 배포 명세 전체를 사용합니다. 외부 설치본으로 대체하지 않습니다.
+package_names=$(python3 - "$project_dir/manifest.json" <<'R1_PACKAGES_PYTHON'
+import json
+from pathlib import Path
+import re
+import sys
+
+manifest = Path(sys.argv[1])
+packages = json.loads(manifest.read_text())['packages']
+if not isinstance(packages, dict) or 'boot_manager' not in packages:
+    sys.exit('오류: 배포 명세의 패키지 목록이 잘못되었습니다.')
+for name, binaries in sorted(packages.items()):
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]*', name):
+        sys.exit('오류: 잘못된 배포 패키지 이름: ' + str(name))
+    for binary in binaries:
+        path = manifest.parent / 'install/lib' / name / binary
+        if not path.is_file() or not path.stat().st_mode & 0o111:
+            sys.exit('오류: 배포 실행 파일이 없습니다: ' + str(path))
+    print(name)
+R1_PACKAGES_PYTHON
+)
+while IFS= read -r package; do
     prefix=$(ros2 pkg prefix "$package" 2>/dev/null) || prefix=
-    if [[ $prefix != "$project_dir/install/"* ]]; then
+    if [[ $prefix != "$project_dir/install" && $prefix != "$project_dir/install/"* ]]; then
         printf '오류: %s 설치본이 %s/install에 없습니다.\n' "$package" "$project_dir" >&2
         exit 1
     fi
-done
+done <<< "$package_names"
 
 command_path=$(type -P -- "${BRINGUP_COMMAND[0]}") || command_path=
 [[ -f $command_path && -x $command_path ]] || {

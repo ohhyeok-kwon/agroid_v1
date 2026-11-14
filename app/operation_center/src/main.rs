@@ -17,21 +17,28 @@ struct StartupWindow {
     height: f64,
 }
 
-struct Backend(Child);
+struct Backend(Option<Child>);
 
-impl Drop for Backend {
-    fn drop(&mut self) {
-        // Give the backend time to close its own SSH observer before exiting.
-        unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
+impl Backend {
+    fn stop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        // The Python backend stops rendering, simulation and its observers.
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
         let until = Instant::now() + Duration::from_secs(6);
         while Instant::now() < until {
-            if matches!(self.0.try_wait(), Ok(Some(_))) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -40,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::var_os("OPERATION_CENTER_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    let mut backend = Backend(
+    let mut backend = Backend(Some(
         Command::new("python3")
             .arg(root.join("server.py"))
             .args(["--port", "0", "--parent", &std::process::id().to_string()])
@@ -48,9 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?,
-    );
+    ));
     let mut url = String::new();
-    BufReader::new(backend.0.stdout.take().ok_or("backend stdout unavailable")?)
+    BufReader::new(backend.0.as_mut().ok_or("backend unavailable")?
+        .stdout.take().ok_or("backend stdout unavailable")?)
         .read_line(&mut url)?;
     let url = url.trim().parse().map_err(|_| "backend did not start")?;
     // Wayland does not let an application restore its absolute window position.
@@ -68,6 +76,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Operation Center 창을 열었습니다.");
             Ok(())
         })
-        .run(tauri::generate_context!())?;
+        .build(tauri::generate_context!())?
+        .run(move |_, event| {
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit)
+                || matches!(event, tauri::RunEvent::WindowEvent {
+                    event: tauri::WindowEvent::Destroyed, ..
+                })
+            {
+                backend.stop();
+            }
+        });
     Ok(())
 }

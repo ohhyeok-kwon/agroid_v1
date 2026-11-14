@@ -3,7 +3,9 @@ pub mod command;
 #[path = "../../../state_manager/src/motion/mod.rs"]
 pub mod motion;
 pub mod observation;
-mod onnx;
+pub mod onnx;
+#[cfg(feature = "ros")]
+pub mod policy_runtime;
 #[cfg(feature = "ros")]
 pub mod runtime;
 use motion::{commands, ActionPhase, Output};
@@ -118,27 +120,30 @@ impl Walking {
         Ok(self.output(actions))
     }
     pub fn output(&self, actions: [f32; 24]) -> Output {
-        let p = &self.parameters;
-        let mut q = [0.; 26];
-        let mut kp = [0.; 26];
-        let mut kd = [0.; 26];
-        // Policy indices differ from the SDK order of our first 24 body joints.
-        for (joint, &policy) in p.action_idx.iter().enumerate() {
-            q[joint] =
-                f64::from(p.default_joint_pos[policy] + actions[policy] * p.action_scale[policy]);
-            kp[joint] = f64::from(p.stiffness[policy]);
-            kd[joint] = f64::from(p.damping[policy]);
-        }
-        // Native policy leaves the two neck commands from Stance in the buffer.
-        q[24] = f64::from(self.head[0]);
-        q[25] = f64::from(self.head[1]);
-        kp[24] = 50.;
-        kp[25] = 10.;
-        kd[24] = 2.;
-        kd[25] = 0.1;
-        Output {
-            phase: ActionPhase::Holding,
-            joints: commands(q, kp, kd),
-        }
+        policy_output(&self.parameters, self.head, actions)
+    }
+}
+
+pub fn policy_output(p: &Parameters, head: [f32; 2], actions: [f32; 24]) -> Output {
+    let mut q = [0.; 26];
+    let mut kp = [0.; 26];
+    let mut kd = [0.; 26];
+    // Policy indices differ from the SDK order of our first 24 body joints.
+    for (joint, &policy) in p.action_idx.iter().enumerate() {
+        q[joint] =
+            f64::from(p.default_joint_pos[policy] + actions[policy] * p.action_scale[policy]);
+        kp[joint] = f64::from(p.stiffness[policy]);
+        kd[joint] = f64::from(p.damping[policy]);
+    }
+    // Native policy leaves the two neck commands from Stance in the buffer.
+    q[24] = f64::from(head[0]);
+    q[25] = f64::from(head[1]);
+    kp[24] = 50.;
+    kp[25] = 10.;
+    kd[24] = 2.;
+    kd[25] = 0.1;
+    Output {
+        phase: ActionPhase::Holding,
+        joints: commands(q, kp, kd),
     }
 }

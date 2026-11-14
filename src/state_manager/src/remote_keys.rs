@@ -36,7 +36,13 @@ pub fn action_for(current: Option<Action>, edges: &Edges) -> Option<Action> {
     }
     if matches!(
         current,
-        Some(Action::ZeroMoment | Action::Damping | Action::Walking)
+        Some(
+            Action::ZeroMoment
+                | Action::Damping
+                | Action::Walking
+                | Action::CarefulWalk
+                | Action::SafeCrouch
+        )
     ) && edges.pressed & UP != 0
     {
         return Some(Action::LockedStanding);

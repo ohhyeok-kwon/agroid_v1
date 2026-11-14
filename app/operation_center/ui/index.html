@@ -14,8 +14,8 @@
   <header class="header">
     <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 2 8.5 5v10L12 22l-8.5-5V7Z M3.5 7 12 12l8.5-5 M12 12v10"/></svg></span>Operation Center</div>
     <span class="header-divider"></span>
-    <nav class="tabs" role="tablist" aria-label="앱 화면"><button id="status-tab" role="tab" aria-selected="true" aria-controls="status-panel">Status</button></nav>
-    <div class="header-end">
+    <nav class="tabs" role="tablist" aria-label="앱 화면"><button id="status-tab" role="tab" aria-selected="true" aria-controls="status-panel">Status</button><button id="trainer-tab" role="tab" aria-selected="false" aria-controls="trainer-panel" tabindex="-1">Trainer</button><button id="simulation-tab" role="tab" aria-selected="false" aria-controls="simulation-panel" tabindex="-1">Simulation(임시)</button></nav>
+    <div id="robot-header" class="header-end">
       <span class="robot-label">UNITREE R1</span>
       <span id="connection-badge" class="badge" data-state="disconnected" role="status" aria-live="polite"><span class="connection-state-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path id="connection-state-mark" d="M4 8h8"/></svg></span><span id="connection-label">연결 안 됨</span></span>
       <div class="connection-actions">
@@ -23,6 +23,8 @@
         <button id="disconnect-button" class="secondary" type="button" hidden>연결 끊기</button>
       </div>
     </div>
+    <div id="simulation-header" class="header-end" hidden><span class="robot-label">LOCAL PHYSICS</span><span id="simulation-badge" class="badge">준비</span></div>
+    <div id="trainer-header" class="header-end" hidden><span class="robot-label">GPU SERVER · TRAINER</span><span id="trainer-service-badge" class="badge">자동 생성 확인 중</span></div>
   </header>
   <main id="status-panel" role="tabpanel" aria-labelledby="status-tab">
     <aside class="sidebar">
@@ -60,7 +62,61 @@
       <div class="axis-legend" aria-label="좌표축: X 전방, Y 좌측, Z 위"><span class="axis-z">Z</span><span class="axis-y">Y</span><span class="axis-x">X</span><svg viewBox="0 0 66 64" aria-hidden="true"><path class="axis-z" d="M33 39V11"/><path class="axis-y" d="M33 39 10 51"/><path class="axis-x" d="m33 39 23 12"/></svg></div>
     </section>
   </main>
-  <footer class="statusbar"><div><span id="footer-status-dot"></span><span id="footer-status">실제 자세 수신 대기</span></div><span>AGROID<span class="statusbar-separator">/</span>OPERATION CENTER</span></footer>
+  <main id="simulation-panel" role="tabpanel" aria-labelledby="simulation-tab" hidden>
+    <aside class="sidebar simulation-sidebar">
+      <div class="sidebar-heading"><span class="eyebrow">INTERACTIVE SIMULATION</span><h1>로봇 시뮬레이션</h1><p>직접 움직이며 동작과 균형을 확인하세요.</p></div>
+      <section class="section"><h2>환경</h2><label class="trainer-label" for="simulation-environment">지형 선택</label><select id="simulation-environment"><option value="flat">평지</option><option value="rocks">큰 돌 지형</option><option value="stairs">계단 · 6cm</option><option value="mixed">돌 + 계단</option></select><p id="simulation-terrain-note" class="trainer-note">장애물 없는 평평한 바닥</p></section>
+      <section class="section"><h2>액션</h2><div id="simulation-actions" class="simulation-actions" aria-label="로봇 액션"></div><div id="simulation-experiments" class="simulation-actions simulation-experiments" aria-label="실험 액션"></div><p id="simulation-policy" class="trainer-note" role="status">걷기 중에도 액션을 전환할 수 있습니다.</p><p id="simulation-experiment-note" class="trainer-note" role="status" hidden></p></section>
+      <section id="simulation-dynamic" class="section simulation-dynamic" hidden><h2>DynamicMode 지시</h2><form id="simulation-instruction-form" class="simulation-instruction"><input id="simulation-instruction" type="text" maxlength="200" placeholder="예: 앞으로 걸어 · 왼쪽으로 돌아 · 살짝 수그려 · 멈춰" autocomplete="off" spellcheck="false" aria-label="문장 지시" aria-describedby="simulation-instruction-status"><button type="submit" class="secondary">보내기</button></form><p id="simulation-instruction-status" class="trainer-note" role="status">문장을 보내면 목표 모델이 머리 카메라와 함께 읽어 지시로 바꿉니다. 처음 한 번은 모델을 불러옵니다.</p><label class="trainer-label" for="simulation-dynamic-speed">걷기 속도</label><select id="simulation-dynamic-speed"><option value="slow">천천히 · 0.2 m/s</option><option value="normal" selected>보통 · 0.35 m/s</option><option value="fast">빠르게 · 0.5 m/s (전진 계열만)</option></select><div id="simulation-dynamic-posture" class="simulation-actions simulation-posture" aria-label="자세"><button type="button" data-posture="rise">일어서기</button><button type="button" data-posture="slight">살짝 앉기</button><button type="button" data-posture="deep">깊게 앉기</button></div></section>
+      <section class="section simulation-launcher"><h2>투사체</h2><label class="launch-speed-label" for="simulation-launch-speed"><span>발사 속도</span><output id="simulation-launch-speed-value" for="simulation-launch-speed">12 m/s</output></label><input id="simulation-launch-speed" type="range" min="5" max="25" step="1" value="12" aria-describedby="simulation-launch-momentum simulation-launch-status"><p id="simulation-launch-momentum" class="trainer-note">1 kg 공 · 운동량 12 kg·m/s</p><p id="simulation-launch-status" class="trainer-note" role="status">로봇을 향해 왼쪽 클릭으로 발사하세요.</p></section>
+      <section class="section"><h2>시뮬레이션</h2><dl class="metrics"><div><dt>경과 시간</dt><dd id="simulation-time">0.0s</dd></div><div><dt>이동 속도</dt><dd id="simulation-speed">0.00 m/s</dd></div></dl><button id="simulation-reset" class="secondary" type="button">로봇 초기화</button><button id="simulation-library" class="secondary" type="button">자동 생성 학습 영상</button></section>
+      <div class="sidebar-footer"><div><strong>로봇 기준 W A S D 이동</strong><p>W/S 전진·후진 · A/D 좌측·우측<br>왼쪽 클릭 발사 · 우클릭 드래그 시점과 보행 방향<br>휠 클릭 드래그 자유 시점 · 휠 스크롤 확대·축소</p></div></div>
+    </aside>
+    <section class="viewport simulation-viewport" aria-label="실시간 물리 시뮬레이션">
+      <img id="simulation-view" tabindex="0" draggable="false" alt="MuJoCo 실시간 시뮬레이션" aria-label="왼쪽 클릭 발사, 휠 클릭 드래그 자유 시점, 우클릭 드래그 시점과 보행 방향, W A S D 로봇 기준 이동">
+      <div class="viewport-heading"><span class="eyebrow">UNITREE R1 · MUJOCO</span><div><h2 id="simulation-action-name">Walking</h2><span class="dof">50 Hz CONTROL · 60 FPS</span></div></div>
+      <div class="view-toolbar"><button id="simulation-reset-view" type="button" title="로봇을 초기 위치에서 Walking으로 다시 시작">로봇 초기화 ↻</button></div>
+      <div id="simulation-loading" class="model-loading"><span class="spinner"></span><span id="simulation-message">시뮬레이션을 준비하고 있습니다.</span></div>
+      <div id="simulation-alert" class="simulation-alert" hidden></div>
+      <div class="simulation-keyboard" aria-label="로봇 기준 이동 키"><div><kbd data-key="KeyW" title="로봇 기준 전진">W</kbd></div><div><kbd data-key="KeyA" title="로봇 기준 좌측">A</kbd><kbd data-key="KeyS" title="로봇 기준 후진">S</kbd><kbd data-key="KeyD" title="로봇 기준 우측">D</kbd></div><span>왼쪽 · 발사 / 휠 · 자유 시점 / 오른쪽 · 시점과 보행 방향</span></div>
+      <output id="simulation-shot-status" class="simulation-shot-status" aria-label="투사체 발사 및 적중 횟수">발사 0 · 적중 0</output>
+      <div class="simulation-world-label" id="simulation-world-label">평지</div>
+    </section>
+  </main>
+  <section id="trainer-panel" class="trainer-panel" role="tabpanel" aria-labelledby="trainer-tab" hidden>
+    <aside class="sidebar trainer-sidebar">
+      <div class="sidebar-heading"><span class="eyebrow">TRAINING HISTORY</span><h1>학습 관리</h1><p>전체 학습 이력과 상태, 산출물을 확인하세요.</p></div>
+      <label class="trainer-label" for="trainer-search">학습 검색</label>
+      <input id="trainer-search" type="search" placeholder="학습 ID 또는 설정 검색" autocomplete="off">
+      <label class="trainer-label" for="trainer-action">액션</label>
+      <select id="trainer-action"><option value="">전체 액션</option><option value="careful_walk">조심 보행</option><option value="safe_crouch">안전 웅크리기</option></select>
+      <label class="trainer-label" for="trainer-state-filter">상태</label>
+      <select id="trainer-state-filter"><option value="">전체 상태</option><option value="starting">초기화 중</option><option value="running">학습 중</option><option value="completed">완료</option><option value="stopped">종료 · 완료 미확인</option><option value="failed">오류</option><option value="unknown">상태 미확인</option></select>
+      <div id="trainer-runs" class="trainer-runs" aria-label="학습 목록"></div>
+      <p id="trainer-list-message" class="trainer-note" role="status">학습 목록을 불러오는 중입니다.</p>
+      <div class="sidebar-footer"><div><strong>10분마다 새 체크포인트 확인</strong><p id="trainer-next">렌더링 상태를 확인하고 있습니다.</p><p>영상 생성에는 몇 분이 걸릴 수 있습니다.</p></div></div>
+    </aside>
+    <section class="trainer-content" aria-label="학습 결과">
+      <div class="trainer-summary" aria-label="전체 학습 현황"><div><span>전체 이력</span><strong id="trainer-total-count">—</strong></div><div><span>학습 중</span><strong id="trainer-running-count">—</strong></div><div><span>완료</span><strong id="trainer-completed-count">—</strong></div><div><span>산출물 있는 학습</span><strong id="trainer-output-count">—</strong></div></div>
+      <p id="trainer-server-status" class="trainer-note" role="status">GPU 서버 상태 확인 중</p>
+      <header class="trainer-heading"><div><span class="eyebrow">RUN DETAILS</span><h2 id="trainer-title">학습을 선택하세요</h2><p id="trainer-id" class="trainer-note"></p></div><span id="trainer-run-state" class="badge"></span></header>
+      <p id="trainer-run-meta" class="trainer-note"></p>
+      <p id="trainer-objective" class="trainer-note"></p>
+      <p id="trainer-run-error" class="trainer-note" role="status" hidden></p>
+      <div id="trainer-details" hidden>
+      <div class="trainer-metrics"><div><span>학습 진행</span><strong id="trainer-progress-label">—</strong><progress id="trainer-progress" max="1" value="0"></progress></div><div><span>최근 반복</span><strong id="trainer-iteration">—</strong></div><div><span>최고 평가 점수</span><strong id="trainer-best-score">—</strong></div><div><span>영상 평가 넘어짐률</span><strong id="trainer-fall">—</strong></div></div>
+      <section class="trainer-artifacts" aria-labelledby="trainer-artifacts-title"><div class="trainer-section-heading"><h3 id="trainer-artifacts-title">산출물</h3><label>종류 <select id="trainer-artifact-kind"><option value="">전체 파일</option><option value="policy">ONNX 정책</option><option value="checkpoint">학습 체크포인트</option><option value="video">결과 영상</option><option value="evaluation">평가·재현 정보</option><option value="config">설정·환경</option><option value="motion">모션 데이터</option><option value="log">로그</option></select></label></div><p id="trainer-artifact-summary" class="trainer-note" role="status"></p><div class="trainer-table-scroll"><table class="trainer-artifact-table"><thead><tr><th scope="col">파일</th><th scope="col">종류</th><th scope="col">반복</th><th scope="col">크기</th><th scope="col">저장</th></tr></thead><tbody id="trainer-artifact-rows"></tbody></table></div></section>
+      <section class="trainer-history"><h3>체크포인트 평가 추이</h3><svg id="trainer-chart" viewBox="0 0 680 130" role="img" aria-label="체크포인트별 평가 점수"></svg><p class="trainer-note">점수는 보행 88환경·10초, 웅크리기 48환경·12초의 외란 평가입니다. 같은 액션끼리 비교하세요. 학습 완료와 실제 로봇 적용 검증은 별개입니다.</p></section>
+      <section class="trainer-video-section"><h3>저장된 결과 영상</h3><div class="trainer-controls"><label>체크포인트<select id="trainer-checkpoint"><option value="latest">최신 영상</option><option value="best">최고 점수 영상</option></select></label><label class="trainer-auto"><input id="trainer-auto" type="checkbox" checked> 새 영상 자동 표시</label></div>
+      <p id="trainer-preview-caption" class="trainer-note" role="status"></p>
+      <div id="trainer-preview" class="trainer-preview">
+        <video id="trainer-video" controls muted loop playsinline preload="metadata" hidden></video>
+        <div id="trainer-empty" class="trainer-empty" role="status">첫 영상이 생성되면 여기에 표시됩니다.</div>
+      </div>
+      </section></div>
+    </section>
+  </section>
+  <footer class="statusbar"><div id="status-footer"><span id="footer-status-dot"></span><span id="footer-status">실제 자세 수신 대기</span></div><div id="simulation-footer" hidden><span></span><span>로컬 물리 시뮬레이션 · 휠 클릭 시점 · 우클릭 보행 방향 · W/A/S/D 이동</span></div><div id="trainer-footer" hidden><span></span><span>GPU 서버 학습 · 이 PC에서 평가 및 영상 생성</span></div><span>AGROID<span class="statusbar-separator">/</span>OPERATION CENTER</span></footer>
 </div>
 </body>
 </html>
