@@ -8,6 +8,7 @@ pub const L2: u16 = 1 << 5;
 pub const R2: u16 = 1 << 4;
 pub const A: u16 = 1 << 8;
 pub const B: u16 = 1 << 9;
+pub const X: u16 = 1 << 10;
 pub const Y: u16 = 1 << 11;
 pub const UP: u16 = 1 << 12;
 const JOY_TIMEOUT_MS: u64 = 250;
@@ -21,8 +22,14 @@ pub struct Edges {
 
 /// Original Static/Damping/ZeroTorque mappings; Stance is FSM 4, not Keep 5.
 pub fn action_for(current: Option<Action>, edges: &Edges) -> Option<Action> {
-    if current == Some(Action::LockedStanding) && edges.held & R2 != 0 && edges.pressed & A != 0 {
-        return Some(Action::Walking);
+    if current == Some(Action::LockedStanding) && edges.held & R2 != 0 {
+        // A: manufacturer walking (811). X: our learned careful walking (812).
+        if edges.pressed & A != 0 {
+            return Some(Action::Walking);
+        }
+        if edges.pressed & X != 0 {
+            return Some(Action::CarefulWalk);
+        }
     }
     if edges.held & L2 == 0 {
         return None;

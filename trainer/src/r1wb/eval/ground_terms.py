@@ -4,7 +4,8 @@ For a task built with teacher_task ground=True (r1wb.world.training_ground): the
 and for every kind of patch (flat, bumps, stones, tilted, down, up, stairs) and level band this prints
   seconds     environment-seconds spent there
   endings     episodes ended per 100 environment-seconds, by reason (fall, trunk on the ground, the course's height,
-              feet height, hands height, tilt, progress lag)
+              feet height, hands height, tilt, progress lag); "all" sums flags and can count an episode repeatedly
+  unique      separate table: non-timeout terminations and physical falls (fallen OR trunk_ground), counted once
   reward      mean step reward
   climbed     mean absolute height of the ground under the feet against the start level (m): how far the robots got
   standing    landings per minute while the course stands still (a foot that was off the ground for 3 steps or more)
@@ -29,6 +30,37 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 10:
 
 REASONS = ("fallen", "trunk_ground", "anchor_z", "feet_z", "hands_z", "anchor_rot", "goal_lag")
 BANDS = ((0, 2), (3, 5), (6, 7))
+
+
+def unique_endings(manager) -> torch.Tensor:
+  """Per-environment [termination, physical fall] flags from the completed control step.
+
+  mjlab's auto-reset logs but preserves these buffers until the next termination compute. Read them immediately
+  after step(), not from the already-reset physical state. A timeout alone is not a termination or a fall.
+  """
+  physical = torch.zeros_like(manager.terminated)
+  for name in ("fallen", "trunk_ground"):
+    if name in manager.active_terms:
+      physical |= manager.get_term(name)
+  return torch.stack((manager.terminated, physical & manager.terminated), dim=1)
+
+
+def print_unique_endings(kinds: list[str], steps: torch.Tensor, ended: torch.Tensor, dt: float) -> None:
+  """Keep the original table parseable; every new row has a distinct 'unique' prefix."""
+  print("unique ground levels seconds terminations physical_falls terminations/100s physical_falls/100s")
+  for k, kind in enumerate(kinds):
+    for b, (low, high) in enumerate(BANDS):
+      i = k * len(BANDS) + b
+      seconds = float(steps[i]) * dt
+      if seconds > 0.0:
+        count = ended[i]
+        print(f"unique {kind} {low}-{high} {seconds:.6f} {int(count[0])} {int(count[1])} "
+              f"{100.0 * float(count[0]) / seconds:.6f} {100.0 * float(count[1]) / seconds:.6f}")
+  seconds = float(steps.sum()) * dt
+  if seconds > 0.0:
+    count = ended.sum(0)
+    print(f"unique all - {seconds:.6f} {int(count[0])} {int(count[1])} "
+          f"{100.0 * float(count[0]) / seconds:.6f} {100.0 * float(count[1]) / seconds:.6f}")
 
 
 def main():
@@ -72,12 +104,14 @@ def main():
 
   steps, reward, climbed, hold_steps, landings, joints, links = (zeros(cells) for _ in range(7))
   ended = zeros(cells, len(REASONS))
+  unique_ended = zeros(cells, 2, kind=torch.long)
   air = zeros(count, 2, kind=torch.long)
   obs = wrapped.get_observations()
   for _ in range(int(args.seconds / dt)):
     with torch.no_grad():
       action = policy(obs)
     obs, gained, dones, _ = wrapped.step(action)
+    unique_ended.index_add_(0, cell, unique_endings(env.termination_manager).long())
     steps.index_add_(0, cell, torch.ones(count, device=device))
     reward.index_add_(0, cell, gained.float())
     climbed.index_add_(0, cell, world.support_under(env).abs())
@@ -114,6 +148,7 @@ def main():
   total = float(steps.sum()) * dt
   print(f"{'all':12s} {'':>6s} {total:8.0f} " + " ".join(f"{100.0 * float(v) / total:9.2f}" for v in ended.sum(0))
         + f" {100.0 * float(ended.sum()) / total:6.2f} {float(reward.sum() / steps.sum()):7.3f}")
+  print_unique_endings(kinds, steps, unique_ended, dt)
 
 
 if __name__ == "__main__":

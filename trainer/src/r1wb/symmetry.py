@@ -112,6 +112,10 @@ class ActorMirror:
   """mirror of the actor's observation (by its width) and of the action."""
 
   def __init__(self, width: int, device):
+    if width == 417:
+      from r1wb.head_resume import mirror_tensors
+      self.obs_index, self.obs_sign, self.act_index, self.act_sign = mirror_tensors(device)
+      return
     from r1wb import senses
     layouts = [actor_layout(False)] + [actor_layout(True, kind) for kind in senses.WIDTH]
     widths = {len(layout.index): layout for layout in layouts}

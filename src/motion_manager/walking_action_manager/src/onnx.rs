@@ -1,5 +1,5 @@
 //! Small Rust binding to the manufacturer's ONNX Runtime 1.18 C API (API 18).
-//! Models and their tensor names are fixed, verified package assets.
+//! Models and their tensor names are fixed, verified package assets of each action package.
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
@@ -69,6 +69,19 @@ impl Session {
 
     /// [1,810] observations -> [1,24] actions. Storage lives through synchronous Run.
     pub fn infer(&mut self, input: &mut [f32; 810]) -> Result<[f32; 24], String> {
+        let mut output = [0.; 24];
+        self.run(c"obs", input, c"actions", &mut output)?;
+        Ok(output)
+    }
+
+    /// One float32 input [1,n] -> one float32 output holding exactly `output.len()` values.
+    pub fn run(
+        &mut self,
+        input_name: &CStr,
+        input: &mut [f32],
+        output_name: &CStr,
+        output: &mut [f32],
+    ) -> Result<(), String> {
         if input.iter().any(|x| !x.is_finite()) {
             return Err("non-finite observation".into());
         }
@@ -92,45 +105,46 @@ impl Session {
                 usize,
                 *mut Handle,
             ) -> Status = self.function(9);
+            let shape = [1, input.len() as i64];
             let mut value = ptr::null_mut();
             self.check(tensor(
                 self.memory,
                 input.as_mut_ptr().cast(),
-                810 * 4,
-                [1, 810].as_ptr(),
+                input.len() * 4,
+                shape.as_ptr(),
                 2,
                 1,
                 &mut value,
             ))?;
-            let mut output = ptr::null_mut();
-            let result = self.check(run(
+            let mut result = ptr::null_mut();
+            let status = self.check(run(
                 self.session,
                 ptr::null_mut(),
-                [c"obs".as_ptr()].as_ptr(),
+                [input_name.as_ptr()].as_ptr(),
                 &value,
                 1,
-                [c"actions".as_ptr()].as_ptr(),
+                [output_name.as_ptr()].as_ptr(),
                 1,
-                &mut output,
+                &mut result,
             ));
             self.release(96, value);
-            if let Err(error) = result {
-                self.release(96, output);
+            if let Err(error) = status {
+                self.release(96, result);
                 return Err(error);
             }
-            let result = self.read_output(output);
-            self.release(96, output);
-            result
+            let status = self.read_output(result, output);
+            self.release(96, result);
+            status
         }
     }
 
-    unsafe fn read_output(&self, output: Handle) -> Result<[f32; 24], String> {
+    unsafe fn read_output(&self, value: Handle, output: &mut [f32]) -> Result<(), String> {
         let shape: unsafe extern "C" fn(Handle, *mut Handle) -> Status = self.function(65);
         let count: unsafe extern "C" fn(Handle, *mut usize) -> Status = self.function(64);
         let dtype: unsafe extern "C" fn(Handle, *mut i32) -> Status = self.function(60);
         let data: unsafe extern "C" fn(Handle, *mut Handle) -> Status = self.function(51);
         let mut info = ptr::null_mut();
-        self.check(shape(output, &mut info))?;
+        self.check(shape(value, &mut info))?;
         let mut n = 0;
         let mut kind = 0;
         let result = self
@@ -138,21 +152,19 @@ impl Session {
             .and_then(|_| self.check(dtype(info, &mut kind)));
         self.release(99, info);
         result?;
-        if n != 24 || kind != 1 {
-            return Err("expected 24 float32 policy actions".into());
+        if n != output.len() || kind != 1 {
+            return Err(format!("expected {} float32 policy actions", output.len()));
         }
         let mut p = ptr::null_mut();
-        self.check(data(output, &mut p))?;
+        self.check(data(value, &mut p))?;
         if p.is_null() {
             return Err("empty policy output".into());
         }
-        let output: [f32; 24] = std::slice::from_raw_parts(p.cast::<f32>(), 24)
-            .try_into()
-            .unwrap();
+        output.copy_from_slice(std::slice::from_raw_parts(p.cast::<f32>(), output.len()));
         if output.iter().any(|v| !v.is_finite()) {
             return Err("non-finite policy action".into());
         }
-        Ok(output)
+        Ok(())
     }
 
     unsafe fn function<T: Copy>(&self, index: usize) -> T {

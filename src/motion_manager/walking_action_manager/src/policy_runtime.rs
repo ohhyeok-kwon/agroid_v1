@@ -23,7 +23,9 @@ pub trait Policy: Send + 'static {
     const NODE: &'static str;
     const STATUS: &'static str;
     fn start(&mut self, input: &Input) -> Result<(), String>;
-    fn sample(&mut self, input: &Input, axes: [f32; 4], elapsed: f64) -> Result<Output, String>;
+    /// `axes`: the remote's sticks [lx, ly, rx, ry] of this tick, or None when no remote data newer than 0.5 s
+    /// exists (remote lost or not yet heard).
+    fn sample(&mut self, input: &Input, axes: Option<[f32; 4]>, elapsed: f64) -> Result<Output, String>;
     fn moving(&self) -> bool {
         false
     }
@@ -132,11 +134,7 @@ pub fn run<P: Policy>(policy: Result<P, String>) -> Result<(), Box<dyn std::erro
         } else if !fresh(goal.issued_mono_ms, now, 500) {
             Err("stale action goal".into())
         } else {
-            let axes = if fresh(s.joy_at, now, 500) {
-                s.axes
-            } else {
-                [0.; 4]
-            };
+            let axes = fresh(s.joy_at, now, 500).then_some(s.axes);
             s.input().and_then(|sample| {
                 s.policy.as_mut().map_err(|e| e.clone())?.sample(
                     &sample,

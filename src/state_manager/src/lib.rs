@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 const BOOT_AGE_MS: u64 = 3000;
 const BOOT_CHECKS: usize = 8;
 const FEEDBACK_AGE_MS: u64 = 500;
+/// Longest age of a learned action manager's status at entry (it reports every 100 ms).
+const POLICY_STATUS_MS: u64 = 500;
 #[derive(Deserialize)]
 struct MotorHealth {
     status_code: u16,
@@ -64,8 +66,9 @@ pub struct Manager {
     motor: Option<(u64, MotorHealth)>,
     remote: Option<(u64, RemoteHealth)>,
     walking: Option<WalkingHealth>,
-    careful_walk: Option<WalkingHealth>,
-    safe_crouch: Option<WalkingHealth>,
+    /// Learned action managers: reception time and status (published every 100 ms).
+    careful_walk: Option<(u64, WalkingHealth)>,
+    safe_crouch: Option<(u64, WalkingHealth)>,
     joints: Option<(u64, [f64; 26])>,
     goal: Option<Goal>,
     result: Option<(u64, u64, ActionPhase)>,
@@ -115,10 +118,11 @@ impl Manager {
     pub fn receive_walking(&mut self, text: &str) {
         self.walking = serde_json::from_str(text).ok();
     }
-    pub fn receive_policy(&mut self, action: Action, text: &str) {
+    pub fn receive_policy(&mut self, action: Action, text: &str, now: u64) {
+        let health = serde_json::from_str(text).ok().map(|health| (now, health));
         match action {
-            Action::CarefulWalk => self.careful_walk = serde_json::from_str(text).ok(),
-            Action::SafeCrouch => self.safe_crouch = serde_json::from_str(text).ok(),
+            Action::CarefulWalk => self.careful_walk = health,
+            Action::SafeCrouch => self.safe_crouch = health,
             _ => {}
         }
     }
@@ -196,9 +200,18 @@ impl Manager {
         Ok(())
     }
 
+    /// A request from the request topic. It can never select a learned action (see `select`).
     pub fn request(&mut self, text: &str, now: u64) {
+        self.select(text, now, false);
+    }
+
+    fn select(&mut self, text: &str, now: u64, remote: bool) {
         let result = (|| -> Result<(), String> {
             let request: Request = serde_json::from_str(text).map_err(|error| error.to_string())?;
+            // A learned policy moves the robot by itself: only the operator's remote may select one.
+            if !remote && matches!(request.action, Action::CarefulWalk | Action::SafeCrouch) {
+                return Err("learned actions are selected with the remote only".into());
+            }
             self.safety_allows(request.action)?;
             if request.action == Action::Damping {
                 if let Some(safety) = &mut self.safety {
@@ -212,12 +225,11 @@ impl Manager {
             match request.action {
                 Action::Walking => {
                     self.motors_ready(now)?;
-                    if current != Some(Action::CarefulWalk)
-                        && (current != Some(Action::LockedStanding)
-                            || self
-                                .result
-                                .as_ref()
-                                .is_none_or(|(_, _, phase)| *phase != ActionPhase::Holding))
+                    if current != Some(Action::LockedStanding)
+                        || self
+                            .result
+                            .as_ref()
+                            .is_none_or(|(_, _, phase)| *phase != ActionPhase::Holding)
                     {
                         return Err("walking starts from completed locked standing".into());
                     }
@@ -231,26 +243,28 @@ impl Manager {
                 }
                 Action::CarefulWalk | Action::SafeCrouch => {
                     self.motors_ready(now)?;
+                    // The tracker starts with an empty history on a standing reference: only from standing.
                     if request.action == Action::CarefulWalk
-                        && current != Some(Action::Walking)
                         && (current != Some(Action::LockedStanding)
                             || self
                                 .result
                                 .as_ref()
                                 .is_none_or(|(_, _, phase)| *phase != ActionPhase::Holding))
                     {
-                        return Err(
-                            "careful walking starts from walking or completed standing".into()
-                        );
+                        return Err("careful walking starts from completed locked standing".into());
                     }
                     let health = if request.action == Action::CarefulWalk {
                         &self.careful_walk
                     } else {
                         &self.safe_crouch
                     };
-                    let health = health
+                    let (at, health) = health
                         .as_ref()
                         .ok_or("waiting for learned action manager")?;
+                    // A manager that stopped reporting must not be entered on its last "ready".
+                    if !fresh(*at, now, POLICY_STATUS_MS) {
+                        return Err("learned action manager stopped reporting".into());
+                    }
                     if !health.ready {
                         return Err(health.message.clone());
                     }
@@ -264,7 +278,7 @@ impl Manager {
                     if (current == Some(Action::Walking)
                         && self.walking.as_ref().is_some_and(|w| w.moving))
                         || (current == Some(Action::CarefulWalk)
-                            && self.careful_walk.as_ref().is_some_and(|w| w.moving))
+                            && self.careful_walk.as_ref().is_some_and(|(_, w)| w.moving))
                     {
                         return Err(
                             "native walking exit: release the joystick before standing".into()
@@ -290,7 +304,7 @@ impl Manager {
     }
 
     pub fn request_remote(&mut self, action: Action, now: u64) {
-        self.request(&json!({"action": action}).to_string(), now);
+        self.select(&json!({"action": action}).to_string(), now, true);
         if let Some(request) = self.last_request.as_mut() {
             request["source"] = json!("remote");
         }
@@ -469,8 +483,8 @@ impl Manager {
             "last_request": self.last_request,
             "actions": {"zero_moment": true, "damping": true, "locked_standing": true,
                 "walking": self.walking.as_ref().is_some_and(|w|w.ready),
-                "careful_walk":self.careful_walk.as_ref().is_some_and(|w|w.ready),
-                "safe_crouch":self.safe_crouch.as_ref().is_some_and(|w|w.ready)}
+                "careful_walk":self.careful_walk.as_ref().is_some_and(|(at,w)|w.ready&&fresh(*at,now,POLICY_STATUS_MS)),
+                "safe_crouch":self.safe_crouch.as_ref().is_some_and(|(at,w)|w.ready&&fresh(*at,now,POLICY_STATUS_MS))}
         })
     }
 }

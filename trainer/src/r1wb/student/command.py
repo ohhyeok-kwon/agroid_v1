@@ -167,11 +167,12 @@ class GoalMotionCommand(LibraryMotionCommand):
       self._goal_history[:, 0] = goal
       own = self.own_twist()
       error = own - self._goal_history[:, -1]
-      clock = getattr(self._env, "hit_clock", None)
-      if self.cfg.lag_grace > 0.0 and clock is not None:
-        # The distance a hit carries the robot is not a debt: nothing is added to the lag for `lag_grace` seconds
-        # after a hit (it keeps leaking), so "walk back to where the goal would have taken you" is never rewarded.
-        error = error * (clock >= self.cfg.lag_grace).float().unsqueeze(1)
+      if self.cfg.lag_grace > 0.0:
+        # Historical evaluation only: suppress new lag during this explicit post-hit window.
+        # With lag_grace=0 every frame is integrated without reading the hit clock.
+        clock = getattr(self._env, "hit_clock", None)
+        if clock is not None:
+          error = error * (clock >= self.cfg.lag_grace).float().unsqueeze(1)
       self.goal_lag = self.goal_lag * math.exp(-dt / self.cfg.lag_time_constant) + dt * error
       self.twist_mean = self.twist_mean + (own - self.twist_mean) * (dt / self.cfg.twist_mean_time)
       self.metrics["goal_lag_xy"][:] = torch.norm(self.goal_lag[:, :2], dim=1)
@@ -216,7 +217,7 @@ class GoalMotionCommandCfg(LibraryMotionCommandCfg):
   # exactly 0.4 m and was never terminated (measured: lag peaks of 0.39-0.40 m on every ignored script); 3 s with
   # the limits in student.env_cfg ends such an episode after about 2 s.
   lag_time_constant: float = 3.0
-  lag_grace: float = 0.0                 # s after an external hit during which the lag does not accumulate
+  lag_grace: float = 0.0          # positive values are historical evaluation only; zero never reads hit timing
   twist_mean_time: float = 0.4     # s, running mean of the own twist used by the twist rewards
   masks_off: bool = False          # with pin_clips: evaluate with height / pitch goals off where allowed
   quiet_stand_foot_range: float = 0.05   # m; a standing clip is "quiet" if neither foot moves farther than this

@@ -136,6 +136,7 @@ initializeView();
 poll();
 const trainer = new TrainerPanel();
 const simulation = new SimulationPanel(() => selectTab($('trainer-tab')));
+const dynamic = new SimulationPanel(() => selectTab($('trainer-tab')), {prefix:'dynamic',dynamic:true});
 const tabs = [...document.querySelectorAll('[role=tab]')];
 function selectTab(tab) {
   for (const item of tabs) {
@@ -145,13 +146,19 @@ function selectTab(tab) {
     $(item.getAttribute('aria-controls')).hidden = !selected;
   }
   const simulating = tab.id === 'simulation-tab';
+  const dynamicMode = tab.id === 'dynamic-tab';
   const training = tab.id === 'trainer-tab';
-  $('robot-header').hidden = $('status-footer').hidden = simulating || training;
+  $('robot-header').hidden = $('status-footer').hidden = simulating || training || dynamicMode;
   $('simulation-header').hidden = $('simulation-footer').hidden = !simulating;
+  $('dynamic-header').hidden = $('dynamic-footer').hidden = !dynamicMode;
   $('trainer-header').hidden = $('trainer-footer').hidden = !training;
+  // Pause the old owner before starting the next tab's commands.
+  if (!simulating) simulation.setVisible(false);
+  if (!dynamicMode) dynamic.setVisible(false);
   simulation.setVisible(simulating);
+  dynamic.setVisible(dynamicMode);
   trainer.setVisible(training);
-  history.replaceState(null, '', simulating ? '#simulation' : training ? '#trainer' : '#status');
+  history.replaceState(null, '', dynamicMode ? '#dynamic' : simulating ? '#simulation' : training ? '#trainer' : '#status');
 }
 tabs.forEach((tab, index) => {
   tab.addEventListener('click', () => selectTab(tab));
@@ -162,7 +169,14 @@ tabs.forEach((tab, index) => {
     tabs[next].focus(); selectTab(tabs[next]);
   });
 });
-const initialHash = location.hash;
-if (initialHash === '#simulation') selectTab($('simulation-tab'));
-if (initialHash === '#trainer') selectTab($('trainer-tab'));
-window.addEventListener('pagehide', () => { stopped = true; view?.destroy(); trainer.destroy(); simulation.destroy(); });
+function route() {
+  const id = {'#simulation':'simulation-tab','#trainer':'trainer-tab','#dynamic':'dynamic-tab','#dynamicmode':'dynamic-tab'}[location.hash] || 'status-tab';
+  selectTab($(id));
+}
+route();
+window.addEventListener('hashchange', route);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { simulation.setVisible(false); dynamic.setVisible(false); }
+  else route();
+});
+window.addEventListener('pagehide', () => { stopped = true; view?.destroy(); trainer.destroy(); simulation.destroy(); dynamic.destroy(); });

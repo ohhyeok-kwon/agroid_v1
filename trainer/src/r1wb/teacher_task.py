@@ -18,10 +18,12 @@ course that follows the robot can neither lead it nor price what a hit does to i
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import math
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg
 from mjlab.tasks.tracking import mdp
 
@@ -35,13 +37,14 @@ from r1wb.tracking.env_cfg import EXPERIMENT, tracking_env_cfg, use_local_anchor
 
 def teacher_task_env_cfg(play: bool = False, clean: bool | None = None, subset: str = "core",
                          disturbance: str = "impulse_events", joint_course: float = 5.0,
-                         hit_grace: float = 2.0, failure_cost: float = 0.0,
+                         hit_grace: float = 0.0, failure_cost: float = 0.0,
                          coherent_course: bool = False, step_cost: float = 0.0,
                          row_share: float | None = None, decisive_course: bool = False,
                          course_travel: float = 0.0, course_cap: float | None = None,
                          steer: str = "", step_rest: bool = False, rest_room: float = 0.0,
                          step_calm: float = 0.0, ground: bool | str = False,
-                         plan_ends: bool = True, senses: str = "") -> ManagerBasedRlEnvCfg:
+                         plan_ends: bool = True, senses: str = "", motion_cost: float = 0.0,
+                         recovery_cost: float | None = None, reset_impulses: bool = False) -> ManagerBasedRlEnvCfg:
   """failure_cost: charged once when an episode ends on a failure (a fall, a lost pose, the progress limit), in
   seconds of reward weight (the reward manager multiplies by the step). While a row of balls lands the step reward is
   negative (measured 11-12 07:35 at a trunk tilt above 0.3 rad: -1.7 to -5 per step: the velocity the balls inject,
@@ -56,9 +59,10 @@ def teacher_task_env_cfg(play: bool = False, clean: bool | None = None, subset: 
   course's posture (per rad and step), a step the course does not take (25 = 0.5 in the learner's units, about
   four steps of calm reward), failing (20).
   step_rest: the step price only for steps taken while the course stands still (step_unprompted `rest`).
-  step_calm: with step_rest, only steps with no hit in the last `step_calm` seconds are charged.
+  hit_grace / step_calm: zero applies identical criteria at every instant, including an impact frame. Positive
+  values preserve historical evaluation only; current no-grace training rejects timed exceptions in its cfg guard.
   rest_room: price per metre and second of the capture point lacking room inside the support while the course
-  stands still and nothing has hit the robot (tracking.mdp.rest_room): the condition those steps come from.
+  stands still, with no post-hit exception (tracking.mdp.rest_room): the condition those steps come from.
   course_travel: price per m/s of the robot's travel leaving the course's travel (tracking.mdp.course_travel_l1), the
   second line of the price list next to the posture price.
   decisive_course: the course generator as System 2's data uses it since 11-13 (r1wb.s2.collect): a look-up asks for
@@ -85,14 +89,26 @@ def teacher_task_env_cfg(play: bool = False, clean: bool | None = None, subset: 
   on a 25 deg slope stand 14 cm apart in height, which the mean alone reads as a foot-height error (the flat-floor
   policy's episodes on the steep levels end on the foot-height criterion and on lagging progress, 11-14 03:00).
   plan_ends=False: leaving the course's heights (pelvis, feet, hands) or its tilt does not end an episode; a fall, the
-  trunk on the ground and lagging progress still do. On shaped ground those departures are the adaptation itself
-  (after a hit they were already suspended for `hit_grace` seconds); the course stays a priced preference.
+  trunk on the ground and lagging progress still do. On shaped ground those departures are the adaptation itself.
+  The course stays a priced preference; physical falls remain judged at all times.
   senses: what the actor reads beyond the plan and its state now (r1wb.senses): "history" (0.2 s of its own body),
   "scan" (the ground around it, also given to the critic) or "both"; appended, so that a policy without them
-  continues as the same function (r1wb.train widened)."""
+  continues as the same function (r1wb.train widened).
+  motion_cost: price per radian of mean measured joint travel (tracking.mdp.joint_motion_l1), always active.
+  Existing command, tracking and failure rewards pay for necessary motion; this term also prices recovery motion.
+  It does not classify individual movements as unnecessary and must be compared with falls and task completion.
+  recovery_cost: bounded task-relative gravity/gyro recovery cost, in reward/s (r1wb.recovery); None omits it.
+  reset_impulses: clear the previous episode's pending hits at reset; enabled equally in both new contrasts."""
+  if not math.isfinite(motion_cost) or motion_cost < 0.0:
+    raise ValueError("motion_cost must be a finite non-negative weight")
+  if recovery_cost is not None and (not math.isfinite(recovery_cost) or not 0.0 <= recovery_cost <= 2.0):
+    raise ValueError("recovery_cost must be finite and in [0, 2] reward/s for the registered contrast budget")
   clean = play if clean is None else clean
   cfg = mixed_env_cfg(play=play, teacher=None, clean=clean, subset=subset, disturbance=disturbance,
                       joint_course=joint_course, hit_grace=hit_grace, stream_course="plan")
+  # The older tracking builder only adds this inside its positive-grace branch. Physical falls must remain
+  # terminal when all timing exemptions are disabled, including when plan_ends=False.
+  cfg.terminations.setdefault("fallen", TerminationTermCfg(func=wb.fallen))
   cfg.commands["motion"].match_commit = coherent_course
   if decisive_course:
     assert coherent_course
@@ -116,6 +132,8 @@ def teacher_task_env_cfg(play: bool = False, clean: bool | None = None, subset: 
   cfg.actions = base.actions
   if row_share is not None and "impulse" in cfg.events:      # a play scene has no disturbance event
     cfg.events["impulse"].params["burst_prob"] = row_share
+  if reset_impulses and "impulse" in cfg.events:
+    cfg.events["impulse"].params["reset_on_episode"] = True
   if course_cap is not None:
     cfg.rewards["joint_course"].params["cap"] = course_cap
   if steer:
@@ -141,11 +159,18 @@ def teacher_task_env_cfg(play: bool = False, clean: bool | None = None, subset: 
     trust = {key: value for key, value in cfg.rewards["joint_course"].params.items() if key in ("command_name", "stream", "grace")}
     cfg.rewards["course_travel"] = RewardTermCfg(func=wb.course_travel_l1, weight=-course_travel, params=trust)
   if rest_room > 0.0:
-    cfg.rewards["rest_room"] = RewardTermCfg(func=wb.rest_room, weight=-rest_room, params={"command_name": "motion"})
+    cfg.rewards["rest_room"] = RewardTermCfg(func=wb.rest_room, weight=-rest_room,
+                                            params={"command_name": "motion", "grace": 0.0})
   if step_cost > 0.0:
     cfg.rewards["step"] = RewardTermCfg(func=wb.step_unprompted, weight=-step_cost,
                                         params={"command_name": "motion", "sensor_name": "feet_ground",
                                                 "foot_bodies": robot.FOOT_BODIES, "rest": step_rest, "calm": step_calm})
+  if motion_cost > 0.0:
+    cfg.rewards["joint_motion"] = RewardTermCfg(func=wb.joint_motion_l1, weight=-motion_cost)
+  if recovery_cost is not None:
+    from r1wb.recovery import recovery_invalid, recovery_risk
+    cfg.rewards["recovery_risk"] = RewardTermCfg(func=recovery_risk, weight=-recovery_cost)
+    cfg.rewards["recovery_invalid"] = RewardTermCfg(func=recovery_invalid, weight=0.0)
   return cfg
 
 

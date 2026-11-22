@@ -8,17 +8,366 @@ import hashlib
 import fcntl
 import importlib.metadata
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import io
 import json
 import os
 import platform
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
+import subprocess
+import tarfile
+import tempfile
 import zipfile
 import numpy as np
 from r1wb.eval.paths import ROOT,AGENT
 
 RESERVE=512*1024**2
+
+def file_sha256(path):
+  with Path(path).open('rb') as stream:
+    return hashlib.file_digest(stream,'sha256').hexdigest()
+
+def copy_verified(source,target,expected):
+  """Link/copy immutable content without replacing any existing destination."""
+  source,target=Path(source),Path(target)
+  if source.is_symlink() or target.is_symlink():raise ValueError('Snapshot files must not be symlinks')
+  if not isinstance(expected,str) or len(expected)!=64 or file_sha256(source)!=expected:
+    raise ValueError(f'SHA256 differs or is missing: {source}')
+  target.parent.mkdir(parents=True,exist_ok=True)
+  if not target.exists():
+    try:os.link(source,target)
+    except FileExistsError:pass
+    except OSError:
+      try:
+        with source.open('rb') as incoming,target.open('xb') as outgoing:shutil.copyfileobj(incoming,outgoing)
+      except FileExistsError:pass
+  if file_sha256(target)!=expected:raise ValueError(f'Existing/copied SHA256 differs: {target}')
+  return target
+
+def _json_atomic(path,value):
+  path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+  with tempfile.NamedTemporaryFile('w',dir=path.parent,prefix='.import-',delete=False) as stream:
+    json.dump(value,stream,indent=2,allow_nan=False);stream.write('\n');temporary=Path(stream.name)
+  temporary.replace(path)
+
+def _preserve_bytes(path,payload):
+  path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+  try:
+    with path.open('xb') as stream:stream.write(payload)
+  except FileExistsError:
+    if path.read_bytes()!=payload:raise ValueError(f'Preserved source differs: {path}')
+  return path
+
+def _safe_name(value):
+  if not value or value in ('.','..') or Path(value).name!=value:raise ValueError(f'Invalid artifact name: {value}')
+  return value
+
+def _locate_import_file(raw,source,remote,tree,*,extra_name=None):
+  raw=PurePosixPath(raw);candidates=[]
+  for old,new in ((remote,source),(remote.parents[2],tree),(remote.parent.parent,tree)):
+    if raw.is_relative_to(old):candidates.append(new/str(raw.relative_to(old)))
+  if extra_name:candidates.append(source/extra_name)
+  candidates.append(source/raw.name)
+  for candidate in candidates:
+    if candidate.is_file() and candidate.resolve().is_relative_to(tree.resolve()):return candidate
+  raise FileNotFoundError(f'Artifact absent from import tree: {raw}')
+
+def _result_destination(root,run,name,payload):
+  digest=hashlib.sha256(payload).hexdigest();target=root/'render'/run/_safe_name(name)
+  if target.exists():
+    old=target.read_bytes()
+    try:identity=json.loads(old).get('capture_import',{}).get('original_result_sha256')
+    except (ValueError,AttributeError):identity=None
+    if hashlib.sha256(old).hexdigest()!=digest and identity!=digest:
+      target=target.with_name(f'{target.stem}_import-{digest[:16]}{target.suffix}')
+      if target.exists() and json.loads(target.read_text()).get('capture_import',{}).get('original_result_sha256')!=digest:
+        raise FileExistsError(f'Existing result preserved: {target}')
+  return target,digest
+
+def _comparison_commands(*records):
+  return [record['comparison_contract']['commands'] for record in records
+          if record and record.get('comparison_contract',{}).get('commands')]
+
+def _import_commands(records,result_root,run,locate):
+  """Rebase the recorded command stream only; contract source/asset paths are provenance."""
+  references=_comparison_commands(*records)
+  if not references:return None
+  expected=references[0]['sha256']
+  if any(entry['sha256']!=expected for entry in references):
+    raise ValueError('Commands differ between result and manifest')
+  name=_safe_name(PurePosixPath(references[0]['path']).name)
+  destination=result_root/'render'/run/name
+  alternate=destination.with_name(f'{destination.stem}_import-{expected[:16]}{destination.suffix}')
+  try:source=locate(references[0]['path'])
+  except FileNotFoundError:
+    source=next((path for path in (destination,alternate) if path.is_file() and file_sha256(path)==expected),destination)
+  if destination.exists() and file_sha256(destination)!=expected:destination=alternate
+  copy_verified(source,destination,expected)
+  for entry in references:entry['path']=str(destination)
+  return dict(references[0])
+
+def _rebase_imported_commands(commands,*records):
+  """Update old imports without replacing their later render/progress metadata."""
+  changed=False
+  for entry in _comparison_commands(*records):
+    if entry['sha256']!=commands['sha256']:raise ValueError('Existing imported commands checksum differs')
+    if entry['path']!=commands['path']:entry['path']=commands['path'];changed=True
+  return changed
+
+def import_results_tree(tree,result_root):
+  """Preserve small remote results first; video readiness waits for the verified archive."""
+  tree,result_root=Path(tree).resolve(),Path(result_root).resolve();outputs=[]
+  for source in sorted((tree/'render').glob('*/*.json')):
+    run=_safe_name(source.parent.name);payload=source.read_bytes();data=json.loads(payload)
+    target,digest=_result_destination(result_root,run,source.name,payload)
+    original=_preserve_bytes(result_root/'transit'/'original-results'/run/(digest+'.json'),payload)
+    def locate_commands(raw):
+      path=source.parent/PurePosixPath(raw).name
+      if not path.is_file():raise FileNotFoundError(path)
+      return path
+    commands=_import_commands((data,data.get('video')),result_root,run,locate_commands)
+    if target.exists() and json.loads(target.read_text()).get('capture_import',{}).get('original_result_sha256')==digest:
+      previous=target.read_bytes();existing=json.loads(previous)
+      if commands and _rebase_imported_commands(commands,existing,existing.get('video')):
+        _preserve_bytes(original.parent/(hashlib.sha256(previous).hexdigest()+'.before-commands.json'),previous)
+        _json_atomic(target,existing)
+      outputs.append(str(target));continue
+    data['capture_import']=dict(status='awaiting_verified_archive',original_result=str(original),original_result_sha256=digest)
+    if target.exists():_preserve_bytes(original.parent/(file_sha256(target)+'.previous.json'),target.read_bytes())
+    _json_atomic(target,data);outputs.append(str(target))
+  for source in sorted((tree/'logs').glob('*/*')):
+    if not source.is_file():continue
+    target=result_root/'logs'/_safe_name(source.parent.name)/source.name;digest=file_sha256(source)
+    if target.exists() and file_sha256(target)!=digest:target=target.with_name(f'{target.stem}_import-{digest[:16]}{target.suffix}')
+    copy_verified(source,target,digest)
+  return outputs
+
+def import_archive(source,result_root,*,tree=None):
+  """Verify a server capture, preserve its original JSON, and rebase only operational paths."""
+  source,result_root=Path(source).resolve(),Path(result_root).resolve();tree=Path(tree or source).resolve()
+  if any(path.is_symlink() for path in source.rglob('*')):raise ValueError('Import source contains an archive symlink')
+  payload=(source/'manifest.json').read_bytes();manifest=json.loads(payload);remote=PurePosixPath(manifest['directory'])
+  if remote.parent.parent.name!='video':raise ValueError('Expected remote video/<run>/<archive> layout')
+  run,name=_safe_name(remote.parent.name),_safe_name(remote.name)
+  target=result_root/'video'/run/name
+  if not target.resolve().is_relative_to(result_root):raise ValueError('Archive destination escapes result root')
+  target.mkdir(parents=True,exist_ok=True)
+  with (target/'import.lock').open('a') as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    digest=hashlib.sha256(payload).hexdigest();existing=None
+    if (target/'manifest.json').exists():
+      existing=json.loads((target/'manifest.json').read_text())
+      if existing.get('capture_import',{}).get('original_manifest_sha256')!=digest:
+        raise FileExistsError(f'Existing archive preserved: {target}')
+    original=_preserve_bytes(target/f'manifest.original-{digest}.json',payload)
+    hashes={}
+    def install(path,relative,expected):
+      destination=copy_verified(path,target/relative,expected);hashes[str(relative)]=expected;return str(destination)
+    if PurePosixPath(manifest['model_path'])!=remote/'model.mjb' or PurePosixPath(manifest['state_path'])!=remote/'states':
+      raise ValueError('Remote model/state paths are not archive-local')
+    manifest['model_path']=install(source/'model.mjb',Path('model.mjb'),manifest['model_sha256'])
+    chunks=manifest['chunk_sha256'];names=sorted(path.name for path in (source/'states').glob('*.npz'))
+    if names!=[f'{i:08d}.npz' for i in range(manifest['frames'])] or set(names)!=set(chunks):
+      raise ValueError('State chunks/count/checksums differ')
+    for name in names:install(source/'states'/name,Path('states')/name,chunks[name])
+    for entry in manifest.get('source_snapshot',{}).values():
+      path=_locate_import_file(entry['snapshot'],source,remote,tree)
+      entry['snapshot']=install(path,Path('sources')/path.name,entry['sha256'])
+    for entry in manifest.get('model_assets',[]):
+      path=_locate_import_file(entry['snapshot'],source,remote,tree)
+      entry['snapshot']=install(path,Path('assets')/(entry['sha256']+path.suffix),entry['sha256'])
+    policy=manifest.get('policy')
+    if policy:
+      path=_locate_import_file(policy['shared_file'],source,remote,tree)
+      policy['shared_file']=install(path,Path('assets')/(policy['sha256']+path.suffix),policy['sha256'])
+    localization=manifest.get('asset_localization')
+    if localization:
+      path=_locate_import_file(localization['original_manifest'],source,remote,tree)
+      localization['original_manifest']=install(path,Path(path.name),localization['sha256'])
+    result=None;result_target=None;result_digest=None
+    if manifest.get('result_json'):
+      try:result_path=_locate_import_file(manifest['result_json'],source,remote,tree,extra_name='result.json')
+      except FileNotFoundError:
+        prior=result_root/'render'/run/PurePosixPath(manifest['result_json']).name
+        record=json.loads(prior.read_text()).get('capture_import',{})
+        result_path=Path(record['original_result'])
+        if file_sha256(result_path)!=record['original_result_sha256']:raise ValueError('Preserved result checksum differs')
+      result_payload=result_path.read_bytes();result=json.loads(result_payload)
+      for key in ('model_sha256','chunk_sha256','frames','directory'):
+        if result.get('video',{}).get(key)!=json.loads(payload)[key]:raise ValueError(f'Result belongs to another capture: {key}')
+      result_target,result_digest=_result_destination(result_root,run,PurePosixPath(manifest['result_json']).name,result_payload)
+      _preserve_bytes(target/f'result.original-{result_digest}.json',result_payload)
+      manifest['result_json']=str(result_target)
+    trace=manifest.get('trace') or (result.get('trace') if result else None)
+    if trace:
+      try:path=_locate_import_file(trace['path'],source,remote,tree)
+      except FileNotFoundError:
+        path=result_root/'logs'/run/PurePosixPath(trace['path']).name
+      trace_path=result_root/'logs'/run/path.name
+      if trace_path.exists() and file_sha256(trace_path)!=trace['sha256']:
+        trace_path=trace_path.with_name(f'{trace_path.stem}_import-{trace["sha256"][:16]}{trace_path.suffix}')
+      copy_verified(path,trace_path,trace['sha256'])
+      trace=dict(trace,path=str(trace_path));manifest['trace']=trace
+      if result is not None and result.get('trace'):
+        if result['trace']['sha256']!=trace['sha256']:raise ValueError('Trace differs between result and manifest')
+        result['trace']=dict(result['trace'],path=str(trace_path))
+    commands=_import_commands((manifest,result,result.get('video') if result else None),result_root,run,
+                              lambda raw:_locate_import_file(raw,source,remote,tree))
+    # A proper actor trace has an independent manifest: verify its declared
+    # checksums, not merely the bytes found by the generic preservation pass.
+    def actor_references(*records):
+      return [record['proper_evaluation']['actor_trace'] for record in records
+              if record and record.get('proper_evaluation',{}).get('actor_trace')]
+    actor_refs=actor_references(manifest,result,result.get('video') if result else None)
+    actor_trace=None
+    if actor_refs:
+      actor_digest=actor_refs[0]['sha256']
+      if any(entry['sha256']!=actor_digest for entry in actor_refs):
+        raise ValueError('Actor input traces differ between result and manifest')
+      actor_remote=PurePosixPath(actor_refs[0]['path'])
+      if actor_remote!=remote/'actor_inputs'/'manifest.json':
+        raise ValueError('Actor input manifest must be archive-local')
+      actor_source=source/'actor_inputs';actor_manifest=actor_source/'manifest.json'
+      if file_sha256(actor_manifest)!=actor_digest:raise ValueError('Actor input manifest checksum differs')
+      actor=json.loads(actor_manifest.read_text())
+      if actor.get('schema')!='r1wb-actor-input-trace-v1' or actor.get('state')!='complete':
+        raise ValueError('Actor input trace is not complete')
+      count=len(actor.get('metadata',{}).get('noise_seeds',[]))
+      if count!=len(manifest['environments']):raise ValueError('Actor trace environment coverage differs')
+      expected_step=0;declared=set()
+      for entry in actor['chunks']:
+        name=_safe_name(entry['path']);declared.add(name)
+        installed=install(actor_source/name,Path('actor_inputs')/name,entry['sha256'])
+        with np.load(installed,allow_pickle=False) as values:
+          steps=values['step'];frames=int(entry['frames'])
+          if (frames<=0 or not np.array_equal(steps,np.arange(expected_step,expected_step+frames))
+              or entry['first_step']!=expected_step or entry['last_step']!=expected_step+frames-1):
+            raise ValueError('Actor input frame gap/count mismatch')
+          if values['actor_input'].shape[:2]!=(frames,count) or values['actor_clean'].shape!=values['actor_input'].shape:
+            raise ValueError('Actor input tensor coverage differs')
+          expected_step+=frames
+      if (expected_step!=actor['frames'] or expected_step!=actor['expected_steps']
+          or expected_step!=actor_refs[0]['frames']):raise ValueError('Actor trace expected horizon differs')
+      outcome=actor['outcomes'];name=_safe_name(outcome['path']);declared.add(name)
+      installed=install(actor_source/name,Path('actor_inputs')/name,outcome['sha256'])
+      with np.load(installed,allow_pickle=False) as values:
+        if outcome['frames']!=expected_step or not np.array_equal(values['step'],np.arange(expected_step)):
+          raise ValueError('Actor outcome frame coverage differs')
+        for key in ('done','physical_terminated','first_physical_fall','alive_after'):
+          if values[key].shape!=(expected_step,count):raise ValueError('Actor outcome environment coverage differs')
+      if {p.name for p in actor_source.glob('*.npz')}!=declared:
+        raise ValueError('Actor trace contains undeclared or missing NPZ chunks')
+      actor_local=install(actor_manifest,Path('actor_inputs/manifest.json'),actor_digest)
+      actor_trace=dict(actor_refs[0],path=actor_local)
+      for entry in actor_refs:entry['path']=actor_local
+    def rebase_actor_trace(*records):
+      changed=False
+      if actor_trace is not None:
+        for entry in actor_references(*records):
+          if entry['sha256']!=actor_trace['sha256']:raise ValueError('Existing actor trace checksum differs')
+          if entry['path']!=actor_trace['path']:entry['path']=actor_trace['path'];changed=True
+      return changed
+    for path in source.rglob('*'):
+      if path.is_symlink():raise ValueError(f'Archive symlink is not self-contained: {path}')
+      if path.is_file() and path!=source/'manifest.json':
+        relative=path.relative_to(source)
+        if str(relative) not in hashes:install(path,relative,file_sha256(path))
+    manifest.update(directory=str(target),state_path=str(target/'states'))
+    manifest['capture_import']=dict(status='verified',original_manifest=str(original),original_manifest_sha256=digest,
+      original_result_sha256=result_digest,artifact_sha256=hashes)
+    if existing is not None:
+      if commands or actor_trace:
+        updated=bool(commands and _rebase_imported_commands(commands,existing))
+        updated=rebase_actor_trace(existing) or updated
+        if result_target is not None and result_target.exists():
+          previous=result_target.read_bytes();local_result=json.loads(previous)
+          if local_result.get('capture_import',{}).get('original_result_sha256')!=result_digest:
+            raise ValueError('Existing imported result identity differs')
+          result_updated=bool(commands and _rebase_imported_commands(commands,local_result,local_result.get('video')))
+          result_updated=rebase_actor_trace(local_result,local_result.get('video')) or result_updated
+          if result_updated:
+            _preserve_bytes(target/f'result.before-commands-{hashlib.sha256(previous).hexdigest()}.json',previous)
+            _json_atomic(result_target,local_result)
+        if updated:
+          previous=(target/'manifest.json').read_bytes()
+          _preserve_bytes(target/f'manifest.before-commands-{hashlib.sha256(previous).hexdigest()}.json',previous)
+          _json_atomic(target/'manifest.json',existing)
+      return existing  # Preserve all later local render/progress metadata on repeated imports.
+    if result is not None:
+      if result_target.exists():_preserve_bytes(target/f'result.previous-{file_sha256(result_target)}.json',result_target.read_bytes())
+      result['video']=manifest
+      result['capture_import']=dict(status='verified',original_result=str(target/f'result.original-{result_digest}.json'),
+                                    original_result_sha256=result_digest,archive=str(target))
+      _json_atomic(result_target,result)
+    _json_atomic(target/'manifest.json',manifest)
+    return manifest
+
+def import_archive_tree(tree,result_root):
+  tree=Path(tree).resolve();results=[]
+  for path in sorted(tree.rglob('manifest.json')):
+    if (path.parent/'states').is_dir():results.append(import_archive(path.parent,result_root,tree=tree))
+  if not results:raise ValueError('No captured vector archives in import tree')
+  return results
+
+def import_bundle(bundle,result_root,expected_sha256=None):
+  """Extract into a fresh retained staging area; no server/local originals are deleted."""
+  bundle,result_root=Path(bundle).resolve(),Path(result_root).resolve();digest=file_sha256(bundle)
+  if expected_sha256 is not None and digest!=expected_sha256:raise ValueError('Transferred bundle checksum differs')
+  transit=result_root/'transit';transit.mkdir(parents=True,exist_ok=True)
+  staging=Path(tempfile.mkdtemp(prefix='import-',dir=transit));tree=staging/'extracted';tree.mkdir()
+  receipt=dict(bundle=str(bundle),sha256=digest,server_sha_verified=expected_sha256 is not None,status='extracting',tree=str(tree))
+  _json_atomic(staging/'receipt.json',receipt)
+  try:
+    if bundle.name.endswith('.zst'):
+      with subprocess.Popen(['zstd','-d','--long=27','-q','-c',str(bundle)],stdout=subprocess.PIPE) as process:
+        try:
+          with tarfile.open(fileobj=process.stdout,mode='r|') as archive:archive.extractall(tree,filter='data')
+        finally:process.stdout.close()
+        if process.wait()!=0:raise ValueError('Bundle decompression failed')
+    else:
+      with tarfile.open(bundle) as archive:archive.extractall(tree,filter='data')
+    imported=import_archive_tree(tree,result_root)
+    receipt.update(status='verified',archives=[m['directory'] for m in imported]);return receipt
+  except BaseException as error:
+    receipt.update(status='partial',reason=f'{type(error).__name__}: {error}');raise
+  finally:_json_atomic(staging/'receipt.json',receipt)
+
+def _localize_asset_snapshots(directory,manifest):
+  localized=[]
+  for asset in manifest.get('model_assets',[]):
+    source=Path(asset['snapshot']);expected=asset['sha256']
+    target=copy_verified(source,directory/'assets'/(expected+source.suffix),expected)
+    entry=dict(asset);entry.setdefault('original_snapshot',str(source));entry['snapshot']=str(target)
+    localized.append(entry)
+  policy=manifest.get('policy')
+  if policy:
+    source=Path(policy['shared_file']);expected=policy['sha256']
+    target=copy_verified(source,directory/'assets'/(expected+source.suffix),expected)
+    policy.setdefault('original_shared_file',str(source));policy['shared_file']=str(target)
+  manifest['model_assets']=localized
+  return localized
+
+def localize_archive_tree(tree):
+  """Prepare old captures for packing while retaining their exact pre-localization manifests."""
+  outputs=[]
+  for path in sorted(Path(tree).rglob('manifest.json')):
+    if not (path.parent/'states').is_dir():continue
+    payload=path.read_bytes();manifest=json.loads(payload)
+    if not manifest.get('capture_complete'):
+      pid=int(manifest.get('capture_pid',-1))
+      if pid>1 and manifest.get('capture_host',platform.node())==platform.node():
+        try:os.kill(pid,0)
+        except OSError:pass
+        else:raise RuntimeError(f'Incomplete capture is still live: {path}')
+    digest=hashlib.sha256(payload).hexdigest()
+    _localize_asset_snapshots(path.parent,manifest)
+    if manifest==json.loads(payload):
+      outputs.append(str(path.parent));continue
+    backup=_preserve_bytes(path.parent/f'manifest.before-assets-{digest}.json',payload)
+    manifest['asset_localization']=dict(original_manifest=str(backup),sha256=digest)
+    _json_atomic(path,manifest);outputs.append(str(path.parent))
+  return outputs
 
 def array(value):
   return value.detach().cpu().numpy() if hasattr(value,'detach') else np.asarray(value)
@@ -31,16 +380,18 @@ def destination(onnx,out=None):
     parts=Path(out).resolve().parts
     if 'render' in parts and len(parts)>parts.index('render')+1:run=parts[parts.index('render')+1]
   run=''.join(c if c.isalnum() or c in '-_@.' else '_' for c in run)
-  stamp=datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+  stamp=datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%d-%H%M%S-%f')
   return AGENT/'result/video'/run/f'{stamp}_{Path(out).stem if out else "vector_eval"}'
 
 class VectorVideoArchive:
-  def __init__(self,env,directory,labels,min_free_bytes=RESERVE):
+  def __init__(self,env,directory,labels,min_free_bytes=RESERVE,*,compressed=False):
     self.env=env;self.directory=Path(directory);self.labels=labels;self.reserve=min_free_bytes
+    self.compressed=bool(compressed)
     self.episodes=np.zeros(env.num_envs,dtype=np.int32);self.step=0;self.started=False;self.archive=None
     self.manifest=dict(protocol_version=2,capture_pid=os.getpid(),status='pending',reason='State capture awaiting local rendering',
         directory=str(self.directory),state_path=str(self.directory/'states'),model_path=str(self.directory/'model.mjb'),
-        step_dt=env.step_dt,frames=0,capture_complete=False,chunk_sha256={},
+        step_dt=env.step_dt,frames=0,capture_complete=False,chunk_sha256={},capture_host=platform.node(),
+        state_compression='npz_deflate' if self.compressed else 'npz_store',
         sampling_scope='qpos/qvel/ctrl/action/command/wrench at every policy tick plus pre-reset terminal; no substep forces, contact impulses or RNG stream. DR model fields sampled at the same ticks.',
         replay_scope='Exact stored visual states at policy ticks and pre-reset terminals; physics replay is not exact: substep contacts/noise RNG are not recorded.',environments=[dict(env_id=i,command=label,videos=[],status='pending') for i,label in enumerate(labels)])
     self.original_reset=env._reset_idx
@@ -100,6 +451,20 @@ class VectorVideoArchive:
       (self.directory/'manifest.json').write_text(json.dumps(self.manifest,indent=2))
     except Exception as error:self.fail(error)
 
+  def localize_assets(self):
+    """After begin(), make model/policy snapshots self-contained and verify every byte hash."""
+    if not self.started:raise RuntimeError('localize_assets requires a successfully started archive')
+    try:
+      localized=_localize_asset_snapshots(self.directory,self.manifest)
+      temporary=self.directory/'manifest.tmp'
+      temporary.write_text(json.dumps(self.manifest,indent=2));temporary.replace(self.directory/'manifest.json')
+      return localized
+    except Exception as error:
+      self.fail(error)
+      temporary=self.directory/'manifest.tmp'
+      temporary.write_text(json.dumps(self.manifest,indent=2));temporary.replace(self.directory/'manifest.json')
+      raise
+
   def fail(self,error):
     self.manifest.update(status='unavailable',reason=f'{type(error).__name__}: {error}')
     for row in self.manifest['environments']:row.update(status='unavailable',reason=self.manifest['reason'])
@@ -130,7 +495,8 @@ class VectorVideoArchive:
       for name in ('geom_pos','geom_quat','geom_size','geom_rgba'):
         field=getattr(self.env.sim.model,name,None)
         if field is not None:values[name]=array(field)
-      buffer=io.BytesIO();np.savez(buffer,**values)
+      buffer=io.BytesIO()
+      (np.savez_compressed if self.compressed else np.savez)(buffer,**values)
       path=self.directory/'states'/f'{self.manifest["frames"]:08d}.npz'
       payload=buffer.getvalue()
       temporary=path.with_suffix('.tmp');temporary.write_bytes(payload);temporary.replace(path)
@@ -271,9 +637,27 @@ def render_default(directory):
   finally:owner.close()
 
 if __name__=='__main__':
-  parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('directory',type=Path);parser.add_argument('--owner-pid',type=int,required=True)
+  parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('directory',type=Path,nargs='?');parser.add_argument('--owner-pid',type=int)
+  operation=parser.add_mutually_exclusive_group()
+  operation.add_argument('--import-bundle',type=Path)
+  operation.add_argument('--import-tree',type=Path)
+  operation.add_argument('--import-results',type=Path)
+  operation.add_argument('--localize-tree',type=Path)
+  parser.add_argument('--result-root',type=Path,default=AGENT/'result')
+  parser.add_argument('--sha256')
   args=parser.parse_args()
-  from eval_learned_adversary import AppOwner
-  owner=AppOwner(args.owner_pid);owner.start()
-  try:render(args.directory,owner)
-  finally:owner.close()
+  if args.sha256 and not args.import_bundle:parser.error('--sha256 requires --import-bundle')
+  if args.import_bundle:
+    print(json.dumps(import_bundle(args.import_bundle,args.result_root,args.sha256)))
+  elif args.import_tree:
+    print(json.dumps({'status':'verified','archives':[m['directory'] for m in import_archive_tree(args.import_tree,args.result_root)]}))
+  elif args.import_results:
+    print(json.dumps({'status':'preserved','results':import_results_tree(args.import_results,args.result_root)}))
+  elif args.localize_tree:
+    print(json.dumps({'status':'localized','archives':localize_archive_tree(args.localize_tree)}))
+  else:
+    if args.directory is None or args.owner_pid is None:parser.error('rendering requires directory and --owner-pid')
+    from eval_learned_adversary import AppOwner
+    owner=AppOwner(args.owner_pid);owner.start()
+    try:render(args.directory,owner)
+    finally:owner.close()

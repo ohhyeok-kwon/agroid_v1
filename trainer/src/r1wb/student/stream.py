@@ -43,6 +43,11 @@ if TYPE_CHECKING:
 SCRIPT_COLUMNS = ("duration_s", "vx", "vy", "yaw_rate", "height", "height_on", "pitch", "pitch_on")
 
 
+def _no_hit_reference_hold(value: float) -> None:
+  if not math.isfinite(value) or value != 0.0:
+    raise ValueError("hold_after_hit must be 0: post-hit reference overrides are disabled")
+
+
 class GoalStreamCommand(GoalMotionCommand):
   cfg: GoalStreamCommandCfg
 
@@ -184,6 +189,7 @@ class MatchedStreamCommand(GoalStreamCommand):
   cfg: MatchedStreamCommandCfg
 
   def __init__(self, cfg: MatchedStreamCommandCfg, env: ManagerBasedRlEnv):
+    _no_hit_reference_hold(cfg.hold_after_hit)
     super().__init__(cfg, env)
     names = list(cfg.body_names)
     self._feet = [names.index(name) for name in robot.FOOT_BODIES]
@@ -272,6 +278,7 @@ class MatchedStreamCommand(GoalStreamCommand):
     return torch.cat([position.reshape(count, -1), velocity.reshape(count, -1), root_pos[:, 2:3]], dim=1)
 
   def _query(self, ids: torch.Tensor) -> torch.Tensor:
+    _no_hit_reference_hold(self.cfg.hold_after_hit)
     aimed = self.cfg.match_height == "target"
     counts = self.goal_mask[ids, 1] > 0
     height = torch.where(counts, (self.stream_target if aimed else self.stream)[ids, 3],
@@ -290,18 +297,12 @@ class MatchedStreamCommand(GoalStreamCommand):
     query = torch.cat([now, height.unsqueeze(1), travel, self.own_twist()[ids], pose], dim=1) * self._feature_scale
     # A course does not listen to a hit. With the robot's feet in the query, a hit while walking moved the reference
     # to another gait for good (measured 11-12 03:00), so what the robot did after the hit could not be priced.
-    # match_pose "reference": the pose features are always those of the course's own frame (driven by the command
-    # and by its own state only). hold_after_hit: the same, but only for that long after an external hit; the plan
-    # made before the hit plays on, and afterwards the course re-attaches to wherever the robot is.
-    clock = getattr(self._env, "hit_clock", None)
-    own = self.cfg.match_pose == "reference"
-    if own or (self.cfg.hold_after_hit > 0.0 and clock is not None):
+    # match_pose "reference" always uses the course's own frame. There is no
+    # time after a hit in which reference matching follows a different rule.
+    if self.cfg.match_pose == "reference":
       width = len(self.cfg.pose_scale)
       course = self._all[self.time_steps[ids], -width:]
-      if own:
-        query[:, -width:] = course
-      else:
-        query[:, -width:] = torch.where((clock[ids] < self.cfg.hold_after_hit).unsqueeze(1), course, query[:, -width:])
+      query[:, -width:] = course
     if aimed:
       # The stance is compared as it will be at the commanded height (pelvis up by the difference, feet down by it
       # relative to the pelvis): the pose terms then judge the feet, not the height the command is about to change.
@@ -414,7 +415,7 @@ class MatchedStreamCommandCfg(GoalStreamCommandCfg):
   match_chunk: int = 1024
   match_noise: float = 0.05
   match_pose: str = "robot"                 # whose feet enter the look-up: "robot" (state-matched) or "reference"
-  hold_after_hit: float = 0.0               # s after an external hit during which the course's own feet enter it
+  hold_after_hit: float = 0.0               # compatibility field; nonzero post-hit overrides are rejected
   match_commit: bool = False                # look up only when the scored window is played, the command changes or the clip ends
   # Which height a look-up asks for while the height command is still moving (slew 0.15 m/s): "stream" = its value
   # now, "target" = where it is going (as the twist terms do with the mean over `travel_window`). With "stream" the
@@ -449,6 +450,12 @@ class MatchedStreamCommandCfg(GoalStreamCommandCfg):
   current_weight: tuple[float, ...] = (0.0, 0.0, 0.0)
   pose_scale: tuple[float, ...] = (0.08,) * 6 + (0.5,) * 6 + (0.04,)
   pose_weight: tuple[float, ...] = (1.0,) * 6 + (0.5,) * 6 + (1.0,)
+
+  def __post_init__(self) -> None:
+    parent = getattr(super(), "__post_init__", None)
+    if parent is not None:
+      parent()
+    _no_hit_reference_hold(self.hold_after_hit)
 
   def build(self, env: ManagerBasedRlEnv) -> MatchedStreamCommand:
     return MatchedStreamCommand(self, env)
@@ -615,28 +622,24 @@ def mixed_env_cfg(play: bool = False, teacher: str | None = None, clean: bool | 
                   stream_course: str = "always", stream_hits: bool = True) -> ManagerBasedRlEnvCfg:
   """The student environment with half of the environments on matched command streams (P2b).
   disturbance / joint_course / hit_grace: as in the student environment. stream_course: where the stream
-  environments' reference counts as a course for the labels and the joint-course price: "always", "calm" (not within
-  `hit_grace` seconds of a hit), "never" (the streams are then learned from the goal rewards alone) or "held" (always,
-  and for `hit_grace` seconds after a hit the stream's reference plays on instead of being re-selected from the
-  robot's feet, so it stays a course through the hit like a clip does) or "plan" (always, and the reference is
+  environments' reference counts as a course for the labels and the joint-course price: "always", "never"
+  (the streams are then learned from the goal rewards alone) or "plan" (always, and the reference is
   selected from the command and its own frame only, never from the robot). Other than "always": no episode is driven
   by the teacher. stream_hits=False: the impulses fall on the clip environments only (the streams stay calm, so
   their reference is a course at all times and the reaction is learned where it can be priced)."""
+  if stream_course not in ("always", "never", "plan"):
+    raise ValueError("stream_course must be always, never or plan; post-hit calm/held exemptions are disabled")
   cfg = student_env_cfg(play=play, teacher=teacher, clean=clean, subset=subset, disturbance=disturbance,
                         joint_course=joint_course, hit_grace=hit_grace)
   old = cfg.commands["motion"]
   values = {field.name: getattr(old, field.name) for field in fields(old)}
   cfg.commands = {"motion": MixedGoalCommandCfg(**values)}
-  if stream_course == "held":
-    assert hit_grace > 0.0
-    cfg.commands["motion"].driven_share = 0.0
-    cfg.commands["motion"].hold_after_hit = hit_grace
-  elif stream_course == "plan":       # the course is the command's plan: it never listens to the robot (or a hit)
+  if stream_course == "plan":       # the course is the command's plan: it never listens to the robot (or a hit)
     cfg.commands["motion"].driven_share = 0.0
     cfg.commands["motion"].match_pose = "reference"
   elif stream_course != "always":
     cfg.commands["motion"].driven_share = 0.0
-    trust = {"stream": stream_course, "grace": hit_grace if hit_grace > 0.0 else 2.0}
+    trust = {"stream": stream_course, "grace": 0.0}  # "never" is unconditional, with no implicit hit window.
     if "joint_course" in cfg.rewards:
       cfg.rewards["joint_course"].params.update(trust)
     if "bc" in cfg.observations:

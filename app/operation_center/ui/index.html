@@ -14,7 +14,7 @@
   <header class="header">
     <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 2 8.5 5v10L12 22l-8.5-5V7Z M3.5 7 12 12l8.5-5 M12 12v10"/></svg></span>Operation Center</div>
     <span class="header-divider"></span>
-    <nav class="tabs" role="tablist" aria-label="앱 화면"><button id="status-tab" role="tab" aria-selected="true" aria-controls="status-panel">Status</button><button id="trainer-tab" role="tab" aria-selected="false" aria-controls="trainer-panel" tabindex="-1">Trainer</button><button id="simulation-tab" role="tab" aria-selected="false" aria-controls="simulation-panel" tabindex="-1">Simulation(임시)</button></nav>
+    <nav class="tabs" role="tablist" aria-label="앱 화면"><button id="status-tab" role="tab" aria-selected="true" aria-controls="status-panel">Status</button><button id="trainer-tab" role="tab" aria-selected="false" aria-controls="trainer-panel" tabindex="-1">Trainer</button><button id="dynamic-tab" role="tab" aria-selected="false" aria-controls="dynamic-panel" tabindex="-1">DynamicMode</button><button id="simulation-tab" role="tab" aria-selected="false" aria-controls="simulation-panel" tabindex="-1">Simulation(임시)</button></nav>
     <div id="robot-header" class="header-end">
       <span class="robot-label">UNITREE R1</span>
       <span id="connection-badge" class="badge" data-state="disconnected" role="status" aria-live="polite"><span class="connection-state-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path id="connection-state-mark" d="M4 8h8"/></svg></span><span id="connection-label">연결 안 됨</span></span>
@@ -24,6 +24,7 @@
       </div>
     </div>
     <div id="simulation-header" class="header-end" hidden><span class="robot-label">LOCAL PHYSICS</span><span id="simulation-badge" class="badge">준비</span></div>
+    <div id="dynamic-header" class="header-end" hidden><span class="robot-label">LOCAL SIMULATION</span><span id="dynamic-badge" class="badge" role="status">준비</span></div>
     <div id="trainer-header" class="header-end" hidden><span class="robot-label">GPU SERVER · TRAINER</span><span id="trainer-service-badge" class="badge">자동 생성 확인 중</span></div>
   </header>
   <main id="status-panel" role="tabpanel" aria-labelledby="status-tab">
@@ -83,6 +84,37 @@
       <div class="simulation-world-label" id="simulation-world-label">평지</div>
     </section>
   </main>
+  <main id="dynamic-panel" class="dynamic-panel" role="tabpanel" aria-labelledby="dynamic-tab" hidden>
+    <aside class="sidebar simulation-sidebar dynamic-sidebar">
+      <div class="sidebar-heading"><span class="eyebrow">WHOLE BODY CONTROL</span><h1>말로 움직이는 로봇</h1><p>명령을 보내고 움직임을 확인하세요.</p><p id="dynamic-model" class="dynamic-model">선택 모델 확인 중</p></div>
+      <section id="dynamic-dynamic" class="section simulation-dynamic">
+        <h2>문장 명령</h2>
+        <form id="dynamic-instruction-form" class="dynamic-instruction">
+          <label class="sr-only" for="dynamic-instruction">로봇에게 보낼 명령</label>
+          <textarea id="dynamic-instruction" rows="2" maxlength="200" placeholder="예: 앞으로 천천히 걸어" autocomplete="off" spellcheck="false" aria-describedby="dynamic-instruction-status" disabled></textarea>
+          <div class="dynamic-examples" aria-label="명령 예시"><button type="button" data-instruction="앞으로 천천히 걸어">앞으로 걷기</button><button type="button" data-instruction="왼쪽으로 돌아">왼쪽 회전</button><button type="button" data-instruction="살짝 앉아">살짝 앉기</button></div>
+          <button id="dynamic-send" class="primary" type="submit" disabled>명령 보내기 <span>Enter ↵</span></button>
+        </form>
+        <p id="dynamic-instruction-status" class="trainer-note" role="status">첫 문장을 보낼 때 언어 모델을 불러옵니다.</p>
+        <div class="dynamic-goal"><span id="dynamic-source">현재 명령</span><strong id="dynamic-goal">서 있기</strong></div>
+        <button id="dynamic-stop" class="secondary dynamic-stop" type="button" data-motion-control disabled>동작 멈춤 <span>Space</span></button>
+      </section>
+      <section class="section"><h2>직접 조작</h2><label class="trainer-label" for="dynamic-dynamic-speed">W/A/S/D 이동 속도</label><select id="dynamic-dynamic-speed" data-motion-control disabled><option value="slow">천천히 · 0.2 m/s</option><option value="normal" selected>보통 · 0.35 m/s</option><option value="fast">빠르게 · 0.5 m/s (전진 계열)</option></select><div id="dynamic-dynamic-posture" class="simulation-actions simulation-posture" aria-label="자세"><button type="button" data-posture="rise" data-motion-control disabled>일어서기</button><button type="button" data-posture="slight" data-motion-control disabled>살짝 앉기</button><button type="button" data-posture="deep" data-motion-control disabled>깊게 앉기</button></div><p class="trainer-note">키·자세 버튼을 누르면 문장 명령을 대신합니다.</p></section>
+      <section class="section"><h2>환경</h2><label class="sr-only" for="dynamic-environment">지형 선택</label><select id="dynamic-environment"><option value="flat">평지</option><option value="rocks">큰 돌 지형</option><option value="stairs">계단 · 6cm</option><option value="mixed">돌 + 계단</option></select><p id="dynamic-terrain-note" class="trainer-note">장애물 없는 평평한 바닥</p><dl class="dynamic-metrics"><div><dt>경과 시간</dt><dd id="dynamic-time">0.0s</dd></div><div><dt>이동 속도</dt><dd id="dynamic-speed">0.00 m/s</dd></div><div><dt>실시간 비율</dt><dd id="dynamic-realtime">—</dd></div></dl><button id="dynamic-reset" class="secondary" type="button">로봇 초기화</button></section>
+      <details class="section simulation-launcher"><summary>공 던지기</summary><label class="launch-speed-label" for="dynamic-launch-speed"><span>발사 속도</span><output id="dynamic-launch-speed-value" for="dynamic-launch-speed">12 m/s</output></label><input id="dynamic-launch-speed" type="range" min="5" max="25" step="1" value="12" aria-describedby="dynamic-launch-momentum dynamic-launch-status"><p id="dynamic-launch-momentum" class="trainer-note">1 kg 공 · 운동량 12 kg·m/s</p><p id="dynamic-launch-status" class="trainer-note" role="status">로봇을 향해 왼쪽 클릭으로 발사하세요.</p></details>
+      <details class="section dynamic-selection" open><summary>연결 모델과 평가</summary><label class="trainer-label" for="dynamic-model-select">연결 모델</label><select id="dynamic-model-select" aria-describedby="dynamic-selection-note"><option value="e114" selected>E114 · 2248</option><option value="b0">B0 · 2400 (S1 목적, 실험)</option><option value="sonic">SONIC-R1 · 현재 학습</option><option value="sonic_b0">SONIC-R1 · 이식 B@0 (비교)</option></select><p id="dynamic-policy" class="trainer-note">모델 확인 중</p><p id="dynamic-selection-note" class="trainer-note"></p><p id="dynamic-experiment-note" class="trainer-note" hidden></p><button id="dynamic-library" class="secondary" type="button">Trainer에서 학습 기록 보기</button></details>
+    </aside>
+    <section class="viewport simulation-viewport dynamic-viewport" aria-label="DynamicMode 실시간 시뮬레이션">
+      <img id="dynamic-view" tabindex="0" draggable="false" alt="DynamicMode 로봇 시뮬레이션" aria-label="W A S D 이동, Space 동작 멈춤, 우클릭 드래그 방향 전환, 왼쪽 클릭 공 발사">
+      <div class="viewport-heading"><span class="eyebrow">UNITREE R1 · LOCAL SIMULATION</span><div><h2 id="dynamic-action-name">DynamicMode</h2><span class="dof">50 Hz CONTROL</span></div></div>
+      <div class="view-toolbar"><button id="dynamic-pause" type="button" aria-pressed="false">일시정지</button><button id="dynamic-reset-view" type="button" title="현재 지형에서 로봇 초기화">초기화 ↻</button></div>
+      <div id="dynamic-loading" class="model-loading"><span class="spinner"></span><span id="dynamic-message">DynamicMode 모델을 불러오는 중입니다.</span></div>
+      <div id="dynamic-paused" class="dynamic-paused" role="status" hidden>일시정지 <small>재개하면 서 있는 상태로 시작합니다.</small></div>
+      <div id="dynamic-alert" class="simulation-alert" role="status" hidden></div>
+      <div class="simulation-keyboard" aria-label="이동 키"><div><kbd data-key="KeyW">W</kbd></div><div><kbd data-key="KeyA">A</kbd><kbd data-key="KeyS">S</kbd><kbd data-key="KeyD">D</kbd></div><span>우클릭 · 방향 전환 / 휠 · 시점 조절</span></div>
+      <output id="dynamic-shot-status" class="simulation-shot-status" aria-label="공 발사 및 적중 횟수">발사 0 · 적중 0</output><div id="dynamic-world-label" class="simulation-world-label">평지</div>
+    </section>
+  </main>
   <section id="trainer-panel" class="trainer-panel" role="tabpanel" aria-labelledby="trainer-tab" hidden>
     <aside class="sidebar trainer-sidebar">
       <div class="sidebar-heading"><span class="eyebrow">TRAINING HISTORY</span><h1>학습 관리</h1><p>전체 학습 이력과 상태, 산출물을 확인하세요.</p></div>
@@ -116,7 +148,7 @@
       </section></div>
     </section>
   </section>
-  <footer class="statusbar"><div id="status-footer"><span id="footer-status-dot"></span><span id="footer-status">실제 자세 수신 대기</span></div><div id="simulation-footer" hidden><span></span><span>로컬 물리 시뮬레이션 · 휠 클릭 시점 · 우클릭 보행 방향 · W/A/S/D 이동</span></div><div id="trainer-footer" hidden><span></span><span>GPU 서버 학습 · 이 PC에서 평가 및 영상 생성</span></div><span>AGROID<span class="statusbar-separator">/</span>OPERATION CENTER</span></footer>
+  <footer class="statusbar"><div id="status-footer"><span id="footer-status-dot"></span><span id="footer-status">실제 자세 수신 대기</span></div><div id="simulation-footer" hidden><span></span><span>로컬 물리 시뮬레이션 · 휠 클릭 시점 · 우클릭 보행 방향 · W/A/S/D 이동</span></div><div id="dynamic-footer" hidden><span></span><span>PC 시뮬레이션 · W/A/S/D 이동 · Space 동작 멈춤 · 탭을 나가면 일시정지</span></div><div id="trainer-footer" hidden><span></span><span>GPU 서버 학습 · 이 PC에서 평가 및 영상 생성</span></div><span>AGROID<span class="statusbar-separator">/</span>OPERATION CENTER</span></footer>
 </div>
 </body>
 </html>

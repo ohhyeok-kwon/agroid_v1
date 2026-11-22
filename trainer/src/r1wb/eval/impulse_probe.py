@@ -7,9 +7,9 @@ different gait phases. One extra environment per clip is the twin: same clip, no
   joints_moved         joints that leave the twin's angle by more than 0.1 rad in the 2 s after the hit (legs/waist/arms)
   arm_extra_speed      RMS arm joint speed difference to the twin over the same 2 s (rad/s)
   rejoin_s             time until every joint is within 0.1 rad of the twin again and stays there for 0.5 s
-                       (meaningless for a free-running gait whose step timing shifted: use settle_s there)
-  settle_s             time until the 0.4 s running mean of the CoM velocity is within 0.08 m/s of the twin's and
-                       stays there for 0.5 s
+                       (phase-sensitive: retained as a legacy diagnostic, not a recovery verdict)
+  settle_s             time until the 0.4 s EMA of CoM velocity is within 0.08 m/s of the twin's for 0.5 s;
+                       also phase-sensitive, not a recovery verdict across different gaits
   urgent_s, d1_max     time with a positive one-step capture margin, and its peak (r1wb.dynamics, twin velocity as reference)
   outside_s, outside_max_m   primary signal: time and peak of the velocity-error capture point outside the hull of both soles
   extra_steps          foot touchdowns in the 3 s after the hit minus the twin's
@@ -32,11 +32,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import sys
+import shutil
 import time
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -104,6 +106,20 @@ def main():
   parser.add_argument("--impulses", nargs="+", type=float, default=[12.0, 25.0], help="N s")
   parser.add_argument("--repeats", type=int, default=10, help="hit times per clip, direction and impulse")
   parser.add_argument("--first-hit", type=float, default=3.0)
+  parser.add_argument("--seed", type=int, default=None, help="explicit environment and policy RNG seed")
+  parser.add_argument("--comparison-contract", choices=["native-r1", "proper-r1-v1"], default=None,
+                      help="shared corebal initialization and native manufacturer physical-command slew once")
+  parser.add_argument("--observation-profile", choices=["N0", "N1_shared_sensor_v1"], default="N0")
+  parser.add_argument("--sensor-seeds", type=Path, default=None, help="proper-r1-v1: JSON environment noise_seeds, paired by physical channel")
+  parser.add_argument("--case-pack", type=Path, default=None, help="proper-r1-v1 frozen physical case manifest")
+  parser.add_argument("--case-pack-smoke", action="store_true", help="allow a clearly excluded instrumentation subset")
+  parser.add_argument("--actor-trace", type=Path, default=None, help="proper-r1-v1: new trace directory; with video, stored inside the archive")
+  parser.add_argument("--manufacturer-bundle", type=Path, default=None,
+                      help="explicit hash-checked manufacturer input bundle, evaluation only")
+  parser.add_argument("--tag", default="", help="unique comparison label; avoids replacing historical results")
+  parser.add_argument("--protocol", type=Path, default=None, help="frozen comparison protocol to preserve with the results")
+  parser.add_argument("--ground-reference", choices=("", "feet", "pelvis"), default="",
+                      help="use the same ground-relative reference as DynamicMode")
   parser.add_argument("--reflex-gain", type=float, default=0.0,
                       help="stream policies: add gain x (own mean twist - goal twist) to the twist goal the policy sees "
                            "(walk with the push); 0 = off")
@@ -115,6 +131,12 @@ def main():
                            "does the same for the waist too. Answers: does the upper-body reaction keep the robot up, "
                            "and how much do the joints move without it? 'arms0'/'upper0' (first version): arm outputs "
                            "zero instead, which also moves the arms from their posture onto the arm intent.")
+  parser.add_argument("--goal-lag-grace", type=float, choices=(0.0, 2.0), default=None,
+                      help="evaluation-only: compare actual-force-aligned goal-lag accumulation grace (0 or 2 s), "
+                           "including the separate S2View accumulator; requires trace, sync-twins and flat forces")
+  parser.add_argument("--arm-response-scale", type=float, default=None,
+                      help="evaluation-only: scale post-intent PD arm target deviation from the twin after onset; "
+                           "0=twin target, 1=exact original target. Requires trace, sync-twins and flat forces")
   parser.add_argument("--course", nargs="+", default=[],
                       help="diagnostic only (never deployed): joint-name fragments (e.g. shoulder elbow wrist hip_yaw "
                            "waist_yaw); from the first hit on, the outputs of the matching joints are the un-hit twin's "
@@ -183,6 +205,8 @@ def main():
   parser.add_argument("--backbone", type=Path, default=None, help="--goal-model: the vision-language model's folder")
   parser.add_argument("--language", choices=["ko", "en"], default="ko", help="--goal-model: language of the instruction")
   parser.add_argument("--app-pid", type=int, required=True)
+  parser.add_argument("--archive-compression", action="store_true",
+                      help="lossless NPZ compression for server state transport; simulation and sampling are unchanged")
   parser.add_argument("--no-video", action="store_true")
   parser.add_argument("--trace", type=Path, default=None, help="also save the raw time series (npz) for offline analysis")
   parser.add_argument("--library", default="",
@@ -205,6 +229,42 @@ def main():
                            "0.005 it moves 12.5 cm per step and passes half through the trunk)")
   parser.add_argument("--device", default="cuda:0")
   args = parser.parse_args()
+  from r1wb.eval.impulse_diagnostics import validate_options
+  try:
+    diagnostics_enabled = validate_options(args)
+  except ValueError as error:
+    parser.error(str(error))
+  from r1wb.eval.shared_sensor_observation import validate_profile_options
+  try:
+    proper = validate_profile_options(args)
+  except ValueError as error:
+    parser.error(str(error))
+  case_pack = None
+  if args.case_pack is not None:
+    from r1wb.eval.case_pack import load_case_pack
+    case_pack = load_case_pack(args.case_pack, args, allow_subset=args.case_pack_smoke)
+  if proper and case_pack is None:
+    parser.error("proper-r1-v1 requires a sealed --case-pack")
+  comparison = args.comparison_contract in ("native-r1", "proper-r1-v1")
+  if comparison:
+    if args.task not in ("stream_label", "manufacturer") or args.seed is None or not args.tag or not args.protocol:
+      parser.error("native-r1 impulse comparisons require stream_label/manufacturer, seed, unique tag and protocol")
+    if args.task == "stream_label" and (args.s2_head != "h12" or args.tokens != "v2d"):
+      parser.error("native-r1 fixes the app head h12 and tokenizer v2d")
+    if args.library not in ("", "corebal") or args.ground_reference not in ("", "feet"):
+      parser.error("native-r1 fixes corebal/feet")
+    args.library, args.ground_reference = "corebal", "feet"
+  if args.manufacturer_bundle and args.task != "manufacturer":
+    parser.error("manufacturer bundle is evaluation-only and requires --task manufacturer")
+  if args.trace is not None and args.trace.exists():
+    parser.error(f"Trace already exists: {args.trace}")
+  if args.tag and (Path(args.tag).name != args.tag or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for c in args.tag)):
+    parser.error("--tag must contain only letters, digits, _, . and -")
+  if args.seed is not None:
+    import random
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
   os.environ["RL_EVALUATION_APP_PID"] = str(args.app_pid)
   from r1wb.eval.evaluation_video import require_app_owner
   require_app_owner(bind=True)
@@ -218,7 +278,7 @@ def main():
   label = args.task in ("stream_label", "clip_label")
   if manufacturer:
     from r1wb.eval.manufacturer import load as load_manufacturer
-    MANUFACTURER, ManufacturerPolicy = load_manufacturer()
+    MANUFACTURER, ManufacturerPolicy = load_manufacturer(args.manufacturer_bundle, reset_history=comparison)
     checkpoint, iteration = MANUFACTURER, 0
   else:
     checkpoint = (args.checkpoint or max(run.glob("model_*.pt"), key=lambda p: int(p.stem.split("_")[1]))).resolve()
@@ -253,6 +313,11 @@ def main():
       "trunk_ground": TerminationTermCfg(func=wb_mdp.body_on_ground, params={"sensor_name": "trunk_ground"}),
       "fallen": TerminationTermCfg(func=fallen),
     }
+  if comparison:
+    from r1wb.tracking.env_cfg import library_path
+    from r1wb.student.stream import stand_clips
+    cfg.commands["motion"].motion_file = str(library_path("corebal"))
+    cfg.commands["motion"].clip_list = stand_clips(cfg.commands["motion"].motion_file)
   if stream and label:
     cfg.commands["motion"].match_pose = args.match_pose
     cfg.commands["motion"].hold_after_hit = args.hold_after_hit
@@ -281,14 +346,20 @@ def main():
   directions = {**DIRECTIONS, **DIAGONALS}
   cases = [(clip, direction, impulse, repeat) for clip in clips for direction in args.directions
            for impulse in args.impulses for repeat in range(args.repeats)]
+  if case_pack is not None:
+    cases, clips, triples = case_pack.cases, case_pack.clips, case_pack.triples
+    manifest = dict(manifest, clips=[dict(name=r["block_id"], context=r["posture"], length=100000) for r in case_pack.rows])
+    names = [c["name"] for c in manifest["clips"]]
   count = len(cases) + len(clips)                       # the last len(clips) environments are the twins
   twin_of = torch.tensor([len(cases) + clips.index(c[0]) for c in cases], device=args.device)
   cfg.scene.num_envs = count
+  if args.seed is not None:
+    cfg.seed = args.seed
   thrown = ()
   if args.physics_dt > 0.0:
     control = cfg.sim.mujoco.timestep * cfg.decimation
     cfg.sim.mujoco.timestep, cfg.decimation = args.physics_dt, round(control / args.physics_dt)
-  if args.world or args.throw:
+  if args.world or args.throw or args.ground_reference:
     from r1wb import world
     world.apply_ground(cfg, args.world)
     if args.throw:
@@ -298,8 +369,13 @@ def main():
     cfg.scene.sensors = tuple(cfg.scene.sensors) + (head_camera(224),)
   if not stream:
     cfg.commands["motion"].clip_list = tuple(c[0] for c in cases) + tuple(clips)
+  if args.goal_lag_grace is not None:
+    cfg.commands["motion"].lag_grace = args.goal_lag_grace
+  if case_pack is not None:
+    case_pack.configure_cfg(cfg)
   env = ManagerBasedRlEnv(cfg=cfg, device=args.device)
   wrapped = RslRlVecEnvWrapper(env)
+  diagnostic_input = {"actor": None}
   if stream:
     order = [c[0] for c in cases] + clips
     script = torch.zeros(count, 1, 8)
@@ -310,6 +386,19 @@ def main():
     env.command_manager.get_term("motion").set_script(script)
     env.reset()
     command = env.command_manager.get_term("motion")
+    if args.ground_reference:
+      from r1wb import world as ground_world
+      if not proper:
+        ground_world.ground_reference(env, command, args.ground_reference)
+  initialization_qa = case_pack.initialize(env, command) if case_pack is not None else None
+  common_command = None
+  if proper:
+    from r1wb.eval.case_pack import apply_ground_reference
+    from r1wb.eval.common_command import CommonCommand
+    apply_ground_reference(env, command)
+    common_command = CommonCommand(torch.zeros(count, 3, device=env.device), float(env.step_dt))
+    requested_twists = torch.tensor([triples[i] for i in order], device=env.device)
+    common_commands = []
   if label and args.s2_head:
     assert args.task == "stream_label", "--s2-head drives command streams"
     from tensordict import TensorDict
@@ -322,7 +411,7 @@ def main():
     tokenizer = MotionTokenizer.load(WORK / "data/s2" / f"tokenizer_{args.tokens}.pt", args.device)
     head = SmallS2.load(WORK / "data/s2" / f"small_{args.s2_head}.pt", args.device)
     goals = torch.cat([script[:, :, 1:4], script[:, :, 4:6]], dim=2).to(args.device)        # (envs, 1, 5): twist, height, counts
-    state_goal = table_goal(goals)
+    state_goal = (lambda decision: common_command.goal(goals[:, 0])) if proper else table_goal(goals)
     if args.goal_model:
       import random
 
@@ -350,14 +439,26 @@ def main():
       head_steerer = Steer(env, command, steer_policy.see, generator=False, leak=steer_policy.leak, remember=steer_policy.remember, turned=steer_policy.turned)
       state_goal = steered_goal(state_goal, head_steerer, steer_policy)
     view = S2View(env, command, goal_brain(head, state_goal), tokenizer)
+    if args.ground_reference:
+      if proper:
+        apply_ground_reference(env, view)
+      else:
+        ground_world.ground_reference(env, view, args.ground_reference)
     tracker = load_teacher(str(checkpoint), args.device)
     joint_action = env.action_manager.get_term("joint_pos")
 
     def policy(obs):
       if head_steerer is not None and view._calls >= 0:        # once after every control step
         head_steerer.progress.after_step()
-      view.update()
+      previous_lag = view.goal_lag.clone() if args.goal_lag_grace is not None else None
+      common_command.update_view(view) if proper else view.update()
+      if previous_lag is not None:
+        from r1wb.eval.impulse_diagnostics import gate_s2_lag
+        view._lag = gate_s2_lag(previous_lag, view.goal_lag, applied_clock.current, args.goal_lag_grace,
+                                env.step_dt, command.cfg.lag_time_constant)
       seen = teacher_observation(view.env, "motion", joint_action.plain_action, local=True, width=tracker.obs_dim)
+      if diagnostics_enabled:
+        diagnostic_input["actor"] = seen.detach().clone()
       return joint_action.from_plain_action(tracker(TensorDict({"actor": seen}, batch_size=[seen.shape[0]])))
   elif label:
     def policy(obs):
@@ -369,7 +470,20 @@ def main():
     def policy(obs):
       return student_actor(torch.cat([obs["actor"], obs["goal"]], dim=1))
   elif manufacturer:
-    policy = ManufacturerPolicy(env, torch.tensor([triples[i] for i in order], dtype=torch.float, device=args.device))
+    target_twists = torch.tensor([triples[i] for i in order], dtype=torch.float, device=args.device)
+    if comparison:
+      from r1wb.eval.command_contract import NativeCommand
+      native_command = NativeCommand(torch.zeros_like(target_twists), float(env.step_dt))
+      delivered_twists = torch.zeros_like(target_twists)
+      manufacturer_policy = ManufacturerPolicy(env, delivered_twists)
+      manufacturer_commands = []
+
+      def policy(obs):
+        delivered_twists.copy_(common_command.delivered if proper else native_command.step(target_twists))
+        manufacturer_commands.append(delivered_twists.clone())
+        return manufacturer_policy(obs)
+    else:
+      policy = ManufacturerPolicy(env, target_twists)
   elif walker:
     policy = WalkerPolicy(env, torch.tensor([triples[i] for i in order], dtype=torch.float, device=args.device), str(checkpoint))
   elif stream:
@@ -408,6 +522,9 @@ def main():
   dt = float(env.step_dt)
   hit_step = torch.tensor([round((args.first_hit + c[3] / args.repeats) / dt) for c in cases], device=env.device)
   impulse = torch.tensor([c[2] for c in cases], device=env.device)
+  case_tensors = case_pack.tensors(env.device) if case_pack is not None else None
+  if case_tensors is not None:
+    hit_step = case_tensors["hit_step"]
   local = torch.tensor([directions[c[1]] + (0.0,) for c in cases], device=env.device)
   gap_steps = max(1, round(args.burst_gap / dt))
   hit_steps = max(1, round(args.hit_duration / dt))
@@ -419,9 +536,12 @@ def main():
     throw_lead = thrower.lead_steps(throw_speed, dt)      # policy steps of flight before the contact
     assert int(throw_lead.max()) < int(hit_step.min()), "the first hit comes before a body can arrive"
   horizon = int((args.first_hit + 1.0 + args.record + (args.burst - 1) * args.burst_gap) / dt)
+  horizon = max(horizon, int(hit_step.max()) + (args.burst - 1) * gap_steps + round(args.record / dt) + 1)
   shortest = min(manifest["clips"][c]["length"] for c in clips)
   if horizon > shortest - 2:
     horizon = shortest - 2
+  if case_pack is not None:
+    horizon = case_pack.horizon
   out_dir = WORK / "result/render" / run.name
   out_dir.mkdir(parents=True, exist_ok=True)
   tag = ("impulse_probe_manufacturer" if manufacturer else
@@ -484,20 +604,115 @@ def main():
   if args.quiet != "none":
     assert stream and not manufacturer and not walker, "--quiet is defined for the stream policies' action layout only"
     tag += f"_quiet-{args.quiet}" + (f"-first{args.quiet_hits}" if args.quiet_hits else "")
+  if args.goal_lag_grace is not None:
+    tag += f"_laggrace{args.goal_lag_grace:g}"
+  if args.arm_response_scale is not None:
+    tag += f"_armalpha{args.arm_response_scale:g}"
   if args.repeats != 10:
     tag += f"_n{args.repeats}"
+  if args.ground_reference:
+    tag += f"_gref-{args.ground_reference}"
+  if args.seed is not None:
+    tag += f"_seed{args.seed}"
+  if args.tag:
+    tag += f"_{args.tag}"
+    if (out_dir / f"{tag}.json").exists():
+      raise FileExistsError(f"Comparison result already exists: {tag}")
+  comparison_metadata = None
+  twin_metadata = dict(sync_requested=args.sync_twins, full_state_rng_snapshot=False,
+                       scope="same initial clip and noise-free matching where supported; no simulator/RNG snapshot branch",
+                       limitation="different terrain/DR, hidden state and later gait phase are not synchronized")
+  diagnostics_metadata = None
+  if diagnostics_enabled:
+    diagnostics_metadata = dict(evaluation_only=True, goal_lag_grace_s=args.goal_lag_grace,
+      arm_response_scale=args.arm_response_scale, target_space="joint position target after intent and encoder bias, before actuator dynamics",
+      arm_scope="indices 14:24 from first scheduled force step onward; leg/waist and twin targets unchanged",
+      clock="updated after wrench write for this physics interval, before step; post-physics command sees age 0 "
+            "while force acts; next policy sees completed interval age; terminal resets clear clock",
+      clock_changes_env=args.goal_lag_grace is not None,
+      actor_lag_source="S2View._lag" if args.s2_head else "GoalMotionCommand.goal_lag",
+      original_s2_lag="always accumulates; S2View.update does not read command.cfg.lag_grace",
+      existing_quiet="IR residual replacement; different arm intents need not give equal final targets",
+      actor_sampling="exact teacher input before policy forward; pre_qpos/qvel before the corresponding physics interval",
+      target_sampling="original=processed target minus encoder bias; applied=joint_pos_target after apply_actions, "
+                      "including terminal intervals; downstream actuator delay unchanged",
+      pre_sample_offset_s=0.0, full_state_rng_snapshot=False)
+  if initialization_qa is not None:
+    twin_metadata = dict(scope="explicit one-to-one own twin", full_state_rng_snapshot=False, initialization=initialization_qa)
+  if comparison:
+    from r1wb.eval.command_contract import NATIVE_DELTAS, NATIVE_LIMITS, native_model
+    requested = torch.tensor(triples)
+    support = (native_model(requested) == 0).tolist()
+    if not all(support):
+      raise ValueError("This WALK-only impulse witness excludes turn/run commands; use the command suite's support table")
+    initial_state = dict(qpos=env.sim.data.qpos.cpu().tolist(), qvel=env.sim.data.qvel.cpu().tolist())
+    comparison_metadata = dict(name=args.comparison_contract, version=1, noise=args.observation_profile if proper else "N0; no added actor/sensor noise",
+                               raw_twists=triples, native_limits=NATIVE_LIMITS, native_deltas_per_20ms=NATIVE_DELTAS,
+                               command_layers="manufacturer native physical slew once; S2 h12/governor/optional steer unchanged",
+                               hand_mass_kg_each=robot.HAND_MASS, initial_library="corebal", ground_reference="feet",
+                               initial_state=initial_state,
+                               initial_state_sha256=hashlib.sha256(json.dumps(initial_state, sort_keys=True).encode()).hexdigest(),
+                               manufacturer_bundle=getattr(ManufacturerPolicy, "bundle_metadata", None) if manufacturer else None)
+  if proper:
+    comparison_metadata.update(command_adapter=common_command.metadata(), initialization=initialization_qa,
+                               case_pack_sha256=case_pack.digest, instrumentation_only=args.case_pack_smoke)
   archive = None
   if not args.no_video:
     from r1wb.eval.vector_evaluation_video import VectorVideoArchive, destination
     labels = [f"{names[c[0]][:24]}_{c[1]}_{int(c[2])}Ns_{c[3]}" for c in cases] + [f"{names[c][:24]}_twin" for c in clips]
-    archive = VectorVideoArchive(env, destination(run / f"policy_{iteration}.onnx", out_dir / f"{tag}.json"), labels)
+    archive = VectorVideoArchive(env, destination(run / f"policy_{iteration}.onnx", out_dir / f"{tag}.json"), labels,
+                                 compressed=args.archive_compression)
     archive.manifest.update(evaluator=__file__,
-                            evaluation_args=dict({k: str(v) for k, v in vars(args).items()}, run=str(run), checkpoint=str(checkpoint),
-                                                 **({} if manufacturer else {"onnx": str(run / f"policy_{iteration}.onnx")})),
-                            result_json=str(out_dir / f"{tag}.json"))
+                            evaluation_args=dict({k: str(v) for k, v in vars(args).items()}, run=str(run), checkpoint=str(checkpoint)),
+                            result_json=str(out_dir / f"{tag}.json"), twin_initialization=twin_metadata)
+    if diagnostics_metadata is not None:
+      archive.manifest["impulse_diagnostics"] = diagnostics_metadata
+    library_file = Path(cfg.commands["motion"].motion_file)
+    assets = [checkpoint, library_file, library_file.with_suffix(".manifest.json")]
+    if manufacturer:
+      assets.append(Path(ManufacturerPolicy.wrapper_path))
+      bundle_metadata = getattr(ManufacturerPolicy, "bundle_metadata", None)
+      if bundle_metadata:
+        assets += [Path(entry["source"]) for entry in bundle_metadata["assets"]]
+        assets.append(Path(bundle_metadata["manifest"]))
+    if args.protocol is not None:
+      assets.append(args.protocol.resolve())
+    if case_pack is not None:
+      assets += [case_pack.path, args.sensor_seeds.resolve()]
+    if args.s2_head:
+      assets += [WORK / "data/s2" / f"small_{args.s2_head}.pt", WORK / "data/s2" / f"tokenizer_{args.tokens}.pt"]
+    if args.steer:
+      assets += [WORK / "data/s2" / f"steer_{args.steer}.pt"]
+    shared = WORK / "result/video/_assets"
+    shared.mkdir(parents=True, exist_ok=True)
+    archive.manifest["model_assets"] = []
+    for asset in assets:
+      with asset.open("rb") as stream_file:
+        digest = hashlib.file_digest(stream_file, "sha256").hexdigest()
+      saved = shared / (digest + asset.suffix)
+      if not saved.exists():
+        shutil.copyfile(asset, saved)
+      archive.manifest["model_assets"].append(dict(source=str(asset), sha256=digest, snapshot=str(saved)))
     archive.begin()
     if not archive.started:
       raise RuntimeError(archive.manifest.get("reason", "Cannot preserve evaluation"))
+    archive.localize_assets()
+    if comparison_metadata:
+      archive.manifest["comparison_contract"] = comparison_metadata
+    for source in (ROOT / "src/r1wb").rglob("*.py"):
+      content = source.read_bytes()
+      digest = hashlib.sha256(content).hexdigest()
+      saved = archive.directory / "sources" / (digest + "_" + source.name)
+      saved.write_bytes(content)
+      archive.manifest["source_snapshot"][str(source)] = dict(sha256=digest, snapshot=str(saved))
+  sensor_hook = None
+  if proper:
+    from r1wb.eval.shared_sensor_observation import install_sensor_hook, trace_context
+    sensor_hook = install_sensor_hook(env, manufacturer_policy.model if manufacturer else tracker, args, archive,
+                                       kind="manufacturer" if manufacturer else "teacher",
+                                       command=None if manufacturer else view,
+                                       to_policy=manufacturer_policy.to_policy if manufacturer else None)
+    comparison_metadata["observation_contract"] = sensor_hook.stream.metadata
   joint_pos = torch.zeros(horizon, count, 24, device=env.device)
   course_term = env.command_manager.get_term("motion") if (label and not args.s2_head) else None
   if args.plan_lean != 0.0:
@@ -527,7 +742,32 @@ def main():
   push_world = torch.zeros(len(cases), 2, device=env.device)
   raw = dict(target=torch.zeros(horizon, count, 24, device=env.device), gravity=torch.zeros(horizon, count, 3, device=env.device),
              gyro=torch.zeros(horizon, count, 3, device=env.device), height=torch.zeros(horizon, count, device=env.device),
+             root_position=torch.zeros(horizon, count, 3, device=env.device),
+             root_quaternion=torch.zeros(horizon, count, 4, device=env.device),
+             joint_torque=torch.zeros(horizon, count, 24, device=env.device),
              force=torch.zeros(horizon, count, 24, device=env.device)) if args.trace else None
+  target_intervention = label_hook = applied_clock = None
+  if diagnostics_enabled:
+    from r1wb.eval.impulse_diagnostics import AppliedImpulseClock, TargetIntervention
+    assert raw is not None
+    term = env.action_manager.get_term("joint_pos")
+    if tuple(term.target_names) != tuple(robot.JOINTS):
+      raise ValueError("arm diagnostic requires the documented 24-joint action target order")
+    for key, width in (("pre_qpos", env.sim.data.qpos.shape[1]), ("pre_qvel", env.sim.data.qvel.shape[1]),
+                       ("pd_target_original", 24), ("pd_target_applied", 24)):
+      raw[key] = torch.zeros(horizon, count, width, device=env.device)
+    for key in ("applied_clock_at_policy", "applied_clock_for_interval", "episode_length_before"):
+      raw[key] = torch.zeros(horizon, count, device=env.device)
+    raw["applied_force_active"] = torch.zeros(horizon, count, dtype=torch.bool, device=env.device)
+    applied_clock = AppliedImpulseClock(count, env.device, dt)
+    if args.goal_lag_grace is not None:
+      env.hit_clock = applied_clock.current
+    target_intervention = TargetIntervention(term, twin_of, hit_step, args.arm_response_scale, raw)
+    if not args.s2_head:
+      label_model = env.observation_manager.get_term_cfg("bc", "label").func.model
+      def capture_teacher_input(model_, inputs):
+        diagnostic_input["actor"] = inputs[0]["actor"].detach().clone()
+      label_hook = label_model.register_forward_pre_hook(capture_teacher_input)
   reference_term = env.command_manager.get_term("motion") if (args.trace and label) else None
   if reference_term is not None:              # label modes: the course the teacher is asked to follow
     raw["reference"] = torch.zeros(horizon, count, 24, device=env.device)
@@ -554,9 +794,35 @@ def main():
   fell_step = torch.full((count,), horizon, device=env.device)
   observation = wrapped.get_observations()
   started = time.time()
+  if proper and raw is not None:
+    for key in ("external_force_world", "external_torque_world", "external_force_body", "external_torque_body"):
+      raw[key] = torch.zeros(horizon, count, 3, device=env.device)
   for step in range(horizon):
+    if common_command is not None:
+      common_command.advance(step, requested_twists)
+      common_commands.append(common_command.delivered.clone())
+    if sensor_hook is not None:
+      sensor_hook.begin(step, **trace_context(env, alive, requested_twist=torch.tensor([triples[i] for i in order], device=env.device)))
     with torch.no_grad():
       action = policy(observation)
+    if sensor_hook is not None:
+      sensor_hook.finish()
+    if diagnostics_enabled:
+      seen = diagnostic_input["actor"]
+      if seen is None:
+        raise RuntimeError("Exact teacher actor input was not captured")
+      if step == 0:
+        if args.goal_lag_grace is not None and seen.shape[1] < 294:
+          raise ValueError("goal-lag diagnostic requires a task teacher that consumes goal_lag")
+        raw["actor_input"] = torch.zeros(horizon, *seen.shape, device=env.device)
+        raw["actor_goal_lag"] = torch.zeros(horizon, count, 3 if seen.shape[1] >= 294 else 0, device=env.device)
+        diagnostics_metadata["actor_goal_lag_slice"] = [291, 294] if seen.shape[1] >= 294 else None
+      raw["actor_input"][step] = seen
+      raw["actor_goal_lag"][step] = seen[:, 291:294] if seen.shape[1] >= 294 else seen[:, :0]
+      raw["pre_qpos"][step], raw["pre_qvel"][step] = env.sim.data.qpos, env.sim.data.qvel
+      raw["applied_clock_at_policy"][step] = applied_clock.current
+      raw["episode_length_before"][step] = env.episode_length_buf
+      target_intervention.step = step
     if course_ids:
       after = torch.zeros(count, 1, dtype=torch.bool, device=env.device)
       after[:len(cases), 0] = step >= hit_step
@@ -597,7 +863,7 @@ def main():
       if args.quiet.startswith("upper"):
         action[:, 12:14] = torch.where(after, twin_action[:, 12:14], action[:, 12:14])
     since = step - hit_step
-    hitting = (since >= 0) & (since < args.burst * gap_steps) & (since % gap_steps < hit_steps)
+    hitting = case_pack.schedule(step, env.device) if case_pack is not None else ((since >= 0) & (since < args.burst * gap_steps) & (since % gap_steps < hit_steps))
     if args.hold_after_hit > 0.0:      # what the training event maintains: seconds since the last external hit
       last = since - torch.where(since >= 0, (since.clamp(max=args.burst * gap_steps - 1) // gap_steps) * gap_steps, torch.zeros_like(since))
       env.hit_clock = torch.full((count,), 1.0e3, device=env.device)
@@ -621,14 +887,34 @@ def main():
       hitting = torch.zeros_like(hitting)                   # no applied force: the contact does it
     if hitting.any():
       heading = yaw_quat(entity.data.root_link_quat_w[:len(cases)])
-      world = quat_apply(heading, local) * (impulse / (hit_steps * dt)).unsqueeze(1)
+      along_world = case_tensors["forces_world_unit"] if proper else quat_apply(heading, local)
+      world = along_world * (impulse / (hit_steps * dt)).unsqueeze(1)
       arm = torch.tensor([0.0, 0.0, args.hit_height], device=env.device).expand(len(cases), 3)
       forces[:len(cases), 0] = torch.where(hitting.unsqueeze(1), world, torch.zeros_like(world))
       first = (since == 0).unsqueeze(1)
-      push_world = torch.where(first, world[:, :2] / torch.norm(world[:, :2], dim=1, keepdim=True).clamp_min(1e-6), push_world)
+      along = along_world[:, :2]
+      push_world = torch.where(first, along / torch.norm(along, dim=1, keepdim=True).clamp_min(1e-6), push_world)
       torques[:len(cases), 0] = torch.where(hitting.unsqueeze(1), torch.cross(arm, world, dim=1), torch.zeros_like(world))
+    if proper and raw is not None:
+      from mjlab.utils.lab_api.math import quat_apply_inverse
+      body_quat = entity.data.body_link_quat_w[:, torso]
+      raw["external_force_world"][step] = forces[:, 0]
+      raw["external_torque_world"][step] = torques[:, 0]
+      raw["external_force_body"][step] = quat_apply_inverse(body_quat, forces[:, 0])
+      raw["external_torque_body"][step] = quat_apply_inverse(body_quat, torques[:, 0])
     entity.write_external_wrench_to_sim(forces, torques, body_ids=[torso])
+    if diagnostics_enabled:
+      active = (forces.abs().sum(dim=(1, 2)) + torques.abs().sum(dim=(1, 2))) > 0.0
+      current_clock = applied_clock.applied(step, active)
+      raw["applied_clock_for_interval"][step] = current_clock
+      raw["applied_force_active"][step] = active
+      if args.goal_lag_grace is not None:
+        env.hit_clock = current_clock
     observation, _, dones, _ = wrapped.step(action)
+    if sensor_hook is not None:
+      sensor_hook.after_step(dones, env.termination_manager.terminated, alive)
+    if diagnostics_enabled:
+      applied_clock.reset(dones.bool())
     if thrower is not None:
       thrower.after_step(dt)
     if archive is not None:
@@ -655,8 +941,11 @@ def main():
       raw["target"][step], raw["gravity"][step] = entity.data.joint_pos_target, entity.data.projected_gravity_b
       raw["gyro"][step], raw["force"][step] = entity.data.root_link_ang_vel_b, entity.data.actuator_force
       raw["height"][step] = entity.data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
+      raw["root_position"][step] = entity.data.root_link_pos_w
+      raw["root_quaternion"][step] = entity.data.root_link_quat_w
+      raw["joint_torque"][step] = entity.data.qfrc_actuator
       if reference_term is not None:
-        raw["reference"][step] = reference_term.joint_pos
+        raw["reference"][step] = plan_joints() if plan_joints is not None else reference_term.joint_pos
     failed = alive & dones.bool() & env.termination_manager.terminated
     fell_step = torch.where(failed, torch.full_like(fell_step, step), fell_step)
     alive &= ~dones.bool()
@@ -722,6 +1011,9 @@ def main():
                      outside_s=round(float((hull[start:end, index] > dynamics.MARGIN_DEAD_BAND).sum()) * dt, 2),
                      outside_max_m=round(float(hull[start:end, index].max()), 3) if end > start else None,
                      extra_steps=int(touch - twin_touch)))
+  if case_pack is not None:
+    for index, (row, spec) in enumerate(zip(rows, case_pack.rows, strict=True)):
+      row.update(block_id=spec["block_id"], frozen_case=spec, initialization=initialization_qa["rows"][index])
   summary = {}
   for row in rows:
     key = f'{row["context"]}|{row["clip"][:5]}|{row["direction"]}|{int(row["impulse_ns"])}'
@@ -748,9 +1040,53 @@ def main():
   result = dict(protocol="r1wb-impulse-probe-v2", definition=__doc__, task=args.task, run=run.name, iteration=iteration,
                 checkpoint=str(checkpoint), impulse_point=f"{args.hit_body} CoM {args.hit_height:+g} m, {hit_steps} policy step(s)", record_s=horizon * dt,
                 twin_falls=twin_falls, elapsed_s=round(time.time() - started, 1), summary=table, cases=rows)
-  if archive is not None:
-    result["video"] = archive.close()
-  (out_dir / f"{tag}.json").write_text(json.dumps(result, indent=1, default=str))
+  result["evaluation_args"] = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+  if comparison_metadata:
+    if manufacturer or proper:
+      commands_path = out_dir / f"{tag}.commands.npz"
+      with commands_path.open("xb") as commands_file:
+        np.savez_compressed(commands_file, delivered_twist=torch.stack(common_commands if proper else manufacturer_commands).cpu().numpy(),
+                            raw_twist=(requested_twists if proper else target_twists).cpu().numpy(), dt=np.float64(dt), sampling="pre-action")
+      comparison_metadata["commands"] = dict(path=str(commands_path), sha256=hashlib.sha256(commands_path.read_bytes()).hexdigest())
+    result["comparison_contract"] = comparison_metadata
+  result["effective_timing"] = dict(control_dt=dt, hit_duration_s=hit_steps * dt, burst_gap_s=gap_steps * dt,
+                                    trace_sample_offset_s=dt)
+  result["twin_initialization"] = twin_metadata
+  if diagnostics_enabled:
+    from r1wb.eval.impulse_diagnostics import pre_hit_qa
+    qa_keys = ("pre_qpos", "pre_qvel", "actor_input", "pd_target_original", "pd_target_applied")
+    qa = pre_hit_qa({key: raw[key].cpu().numpy() for key in qa_keys}, hit_step.cpu().numpy(),
+                    twin_of.cpu().numpy(), env.scene.env_origins.cpu().numpy())
+    for row, check in zip(rows, qa, strict=True):
+      row["pre_hit_qa"] = check
+    result["impulse_diagnostics"] = diagnostics_metadata
+  if raw is not None:
+    from r1wb.eval.reaction_metrics import pair_summary
+    cpu = {"q": joint_pos.cpu().numpy(), "dq": joint_vel.cpu().numpy(), "contact": contact.cpu().numpy(),
+           "torque": raw["joint_torque"].cpu().numpy(), "root": raw["root_position"].cpu().numpy()}
+    for index, row in enumerate(rows):
+      twin, start = int(twin_of[index]), int(hit_step[index])
+      # Use identical windows and censor either member's first fall; a short survival must never earn low motion.
+      onset = max(0, start - 1)  # post-step sample just before the first impulse; legacy fields keep their old indexing
+      stop = min(onset + round(3.0 / dt) + 1, horizon, int(fell_step[index]), int(fell_step[twin]))
+      sl = slice(onset, max(onset, stop))
+      row["paired_motion"] = pair_summary(cpu["q"][sl, index], cpu["dq"][sl, index], cpu["contact"][sl, index],
+                                           cpu["q"][sl, twin], cpu["dq"][sl, twin], cpu["contact"][sl, twin], dt,
+                                           cpu["torque"][sl, index], cpu["torque"][sl, twin])
+      row["paired_motion"]["complete_window"] = start > 0 and stop == onset + round(3.0 / dt) + 1
+      if stop > onset + 1:
+        row["paired_displacement_xy_m"] = {name: (cpu["root"][stop - 1, who, :2] - cpu["root"][onset, who, :2]).tolist()
+                                             for name, who in (("actual", index), ("twin", twin))}
+      bursts = int(case_tensors["burst_count"][index]) if proper else args.burst
+      late_start = onset + (bursts - 1) * gap_steps + round(2.0 / dt)
+      late_stop = late_start + round(2.0 / dt)
+      row["late_motion"] = None
+      if late_stop < min(horizon, int(fell_step[index]), int(fell_step[twin])):
+        row["late_motion"] = {}
+        for name, who in (("actual", index), ("twin", twin)):
+          delta = cpu["root"][late_stop, who, :2] - cpu["root"][late_start, who, :2]
+          row["late_motion"][name] = dict(mean_velocity_xy_m_s=(delta / 2.0).tolist())
+      row["pre_hit_joint_max_difference_rad"] = float(np.abs(cpu["q"][:start, index] - cpu["q"][:start, twin]).max()) if start else None
   if raw is not None:
     args.trace.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.trace, joint_pos=joint_pos.cpu().numpy(), joint_vel=joint_vel.cpu().numpy(), contact=contact.cpu().numpy(),
@@ -760,6 +1096,22 @@ def main():
                         cases=np.array([f"{manifest['clips'][c[0]]['context']}|{c[1]}|{int(c[2])}|{c[3]}" for c in cases]),
                         support_margin=hull.cpu().numpy(), capture_margin=margin.cpu().numpy(), course_gap=course_gap.cpu().numpy(),
                         **{k: v.cpu().numpy() for k, v in trace.items()}, **{k: v.cpu().numpy() for k, v in raw.items()})
+    with args.trace.open("rb") as trace_file:
+      result["trace"] = dict(path=str(args.trace.resolve()), sha256=hashlib.file_digest(trace_file, "sha256").hexdigest())
+    if archive is not None:
+      archive.manifest["trace"] = result["trace"]
+  if sensor_hook is not None:
+    from r1wb.eval.reaction_metrics import summarize_actor_trace
+    actor_trace = sensor_hook.close(horizon)
+    result["proper_evaluation"] = dict(noise_profile=args.observation_profile, actor_trace=actor_trace,
+                                       fixed_horizon_steps=horizon, observation_contract=sensor_hook.stream.metadata,
+                                       motion_summary=summarize_actor_trace(actor_trace["path"]),
+                                       interventions="none; no post-hit clock, arm scaling or learned steering")
+    if archive is not None:
+      archive.manifest["proper_evaluation"] = result["proper_evaluation"]
+  if archive is not None:
+    result["video"] = archive.close()
+  (out_dir / f"{tag}.json").write_text(json.dumps(result, indent=1, default=str))
   print(f'{"context|clip|dir|Ns":34s}  n fall  joints arms legs  arm_spd rejoin_s(n) settle_s(n) urgent_s steps  outside_s/max')
   for key, v in table.items():
     f = lambda x, w=5, p=2: f'{x:{w}.{p}f}' if x is not None else ' ' * (w - 1) + '-'  # noqa: E731
@@ -813,6 +1165,10 @@ def main():
         a, b = log[d, i], log[d, twin]
         print(f"  {d - first:+3d}: {a[0]:+.2f} {a[1]:+.2f} {a[2]:+.2f} | {a[3]:+.2f} {a[4]:+.2f} {a[5]:+.2f}   /   {b[0]:+.2f} {b[1]:+.2f} {b[2]:+.2f} | {b[3]:+.2f} {b[4]:+.2f} {b[5]:+.2f}")
   print("twin falls:", twin_falls, "| total falls:", sum(r["fell"] for r in rows), "/", len(rows))
+  if target_intervention is not None:
+    target_intervention.close()
+  if label_hook is not None:
+    label_hook.remove()
   env.close()
   _ = (math, robot)
 

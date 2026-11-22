@@ -48,10 +48,11 @@ def load_teacher(checkpoint: str, device: str):
   return model
 
 
-def load_policy(checkpoint: str, device: str, action_dim: int = 24):
+def load_policy(checkpoint: str, device: str, action_dim: int | None = None):
   """A checkpoint's actor as a function of the concatenated observation: the action mean (a network with a
   state-dependent noise head outputs the mean in its first `action_dim` values)."""
   model = load_teacher(checkpoint, device)
+  action_dim = (26 if model.obs_dim == 417 else 24) if action_dim is None else action_dim
 
   def policy(observation: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
@@ -82,7 +83,7 @@ class teacher_label:
     self.model = load_teacher(cfg.params["checkpoint"], env.device)
 
   def __call__(self, env: ManagerBasedRlEnv, command_name: str, checkpoint: str, stream: str = "always",
-               grace: float = 2.0) -> torch.Tensor:
+               grace: float = 0.0) -> torch.Tensor:
     """stream / grace: where a matched command stream's label counts (see tracking.mdp.course_is_trusted)."""
     del checkpoint
     from r1wb.tracking.env_cfg import teacher_observation

@@ -91,6 +91,206 @@ def widened(checkpoint: str, runner, directory: Path, device) -> str:
   return str(target)
 
 
+def resume_training(runner, checkpoint: str, directory: Path, device, *, pad_inputs: bool = False,
+                    freeze_actor_normalizer: bool = False, next_iteration: bool = False, head_contract: bool = False) -> dict:
+  """Load full training state; optionally continue after the iteration already saved in the checkpoint.
+
+  Legacy runs reuse the saved iteration's label. Opting into the next label avoids repeating it, while the actual
+  optimizer update count and learning-rate schedule always come from the saved algorithm state.
+  """
+  if head_contract:
+    from r1wb.head_resume import prepare_resume
+    source = prepare_resume(checkpoint, runner, directory, device)
+  else:
+    source = widened(checkpoint, runner, directory, device) if pad_inputs else checkpoint
+  try:
+    infos = runner.load(source, map_location=device)
+  finally:
+    if source != checkpoint:
+      Path(source).unlink(missing_ok=True)
+  saved_iteration = int(runner.current_learning_iteration)
+  if next_iteration:
+    runner.current_learning_iteration = saved_iteration + 1
+  if freeze_actor_normalizer:
+    runner.alg.actor.obs_normalizer.until = 0
+  return {"resume_widened": source != checkpoint, "resume_checkpoint_iteration": saved_iteration,
+          "resume_source_world_size": (infos or {}).get("world_size"),
+          "resume_source_global_statistics": getattr(runner.alg, "loaded_global_statistics", False)}
+
+
+def record_training_failure(error, record, env, runner, context, *, max_envs: int = 8,
+                            max_tensor_bytes: int = 4 * 1024 * 1024) -> None:
+  """Persist rank failure before cleanup; bounded evidence only, never a resumable checkpoint.
+
+  Reads the failing traceback's observations (or the existing observation cache), without another environment
+  step, observation computation or collective. CUDA failures may prevent tensor reads; the JSON header and rank
+  status are written first. Model/Adam values stay on their device; only finite flags and selected envs are saved.
+  """
+  import os
+  import math
+  import traceback
+
+  import torch
+  from r1lab.run_record import atomic_json
+
+  directory = Path(record.directory)
+  stem = f"failure_rank{context.rank}_{time.time_ns()}"
+  report_path, tensor_path = directory / f"{stem}.json", directory / f"{stem}.pt"
+  errors = []
+
+  def attempt(name, function):
+    try:
+      return function()
+    except Exception as problem:
+      errors.append({"stage": name, "error": f"{type(problem).__name__}: {problem}"})
+      return None
+
+  trace_values, trace_source, iteration = {}, None, None
+  tb = error.__traceback__
+  while tb is not None:
+    values = tb.tb_frame.f_locals
+    if "obs" in values:
+      trace_values.update({key: values[key] for key in ("obs", "rewards", "dones", "actions") if key in values})
+      trace_source = {"file": tb.tb_frame.f_code.co_filename, "line": tb.tb_lineno,
+                      "function": tb.tb_frame.f_code.co_name}
+    if tb.tb_frame.f_code.co_name == "learn" and isinstance(values.get("it"), int):
+      iteration = values["it"]
+    tb = tb.tb_next
+  real = getattr(env, "unwrapped", env) if env is not None else None
+  alg = getattr(runner, "alg", None)
+  report = {"schema_version": 1, "rank": context.rank, "world_size": context.world_size, "pid": os.getpid(),
+            "created_at": time.time(), "stage": "before_cleanup", "capture_complete": False,
+            "error": f"{type(error).__name__}: {error}", "traceback": "".join(traceback.format_exception(error)),
+            "iteration_in_failing_learn": iteration,
+            "last_completed_iteration": getattr(runner, "current_learning_iteration", None),
+            "update_count": getattr(alg, "update_count", None),
+            "common_step_counter": getattr(real, "common_step_counter", None),
+            "observation_source": trace_source, "capture_errors": errors,
+            "limits": {"max_saved_envs": max_envs, "max_tensor_bytes": max_tensor_bytes,
+                       "max_reported_env_ids_per_field": 4096},
+            "run": {key: record.info.get(key) for key in ("id", "task", "seed", "num_envs", "num_envs_per_gpu",
+                    "execution", "global_statistics", "failure_replay_buffer", "resume", "resume_sha256", "resume_next_iteration",
+                    "checkpoint", "start_iteration", "total_iterations")},
+            "limitations": ["Not a resumable checkpoint or proof of the root cause.",
+                            "State is the current state at the exception, possibly after automatic reset.",
+                            "Finite rewards do not rule out invalid term values masked by RewardManager.",
+                            "Contact sensor match capacity and physical contact capacity are distinct."]}
+  attempt("rank_status", lambda: record.update(state="failed", finished_at=time.time(), error=report["error"],
+                                                failure_diagnostics=report_path.name, failure_iteration=iteration))
+  attempt("initial_json", lambda: atomic_json(report_path, report))
+  replay = getattr(real, "_failure_replay_buffer", None)
+  if replay is not None:
+    report["physics_replay"] = attempt("physics_replay", lambda: replay.export(stem))
+  report["config_artifacts"] = {}
+  for name in ("env.yaml", "agent.yaml", "source_snapshot.json", "library.json"):
+    path = directory / "params" / name
+    if path.is_file():
+      report["config_artifacts"][name] = {"path": str(path), "sha256": attempt(name, lambda p=path: hashlib.sha256(p.read_bytes()).hexdigest())}
+  if real is not None:
+    report["rank_seed"] = getattr(getattr(real, "cfg", None), "seed", None)
+    report["control_dt"] = getattr(real, "step_dt", None)
+  finite = report["finite_flags"] = {}
+
+  def finite_state(name, state):
+    flags = {}
+    for key, value in state.items():
+      if isinstance(value, torch.Tensor):
+        flags[str(key)] = bool(torch.isfinite(value.detach()).all().item())
+    finite[name] = {"all_finite": all(flags.values()) if flags else None, "tensor_count": len(flags), "tensors": flags}
+
+  if alg is not None:
+    for name in ("actor", "critic"):
+      model = getattr(alg, f"_raw_{name}", getattr(alg, name, None))
+      if model is not None:
+        attempt(f"finite_{name}", lambda n=name, m=model: finite_state(n, m.state_dict()))
+    optimizer = getattr(alg, "optimizer", None)
+    if optimizer is not None:
+      attempt("finite_optimizer", lambda: finite_state("optimizer", {
+        f"{index}.{key}": value for index, state in enumerate(optimizer.state.values()) for key, value in state.items()}))
+      report["optimizer_learning_rates"] = [repr(group.get("lr")) for group in optimizer.param_groups]
+      report["optimizer_learning_rates_finite"] = attempt("finite_learning_rates", lambda: [
+        math.isfinite(float(group["lr"])) for group in optimizer.param_groups])
+  manager = getattr(real, "observation_manager", None)
+  obs = trace_values.get("obs")
+  if obs is None and manager is not None:
+    obs = getattr(manager, "_obs_buffer", None)  # Never compute fresh observations while diagnosing a failure.
+    report["observation_source"] = "existing observation_manager._obs_buffer"
+  report["observation_layout"] = {"terms": getattr(manager, "active_terms", None),
+                                  "dimensions": getattr(manager, "group_obs_term_dim", None)}
+  fields = {}
+  if obs is not None and hasattr(obs, "items"):
+    fields.update({f"observations.{key}": value for key, value in obs.items()})
+  fields.update({name: value for name, value in trace_values.items() if name != "obs"})
+  sim = getattr(real, "sim", None)
+  sim_cfg = getattr(sim, "cfg", None)
+  report["simulation_capacities"] = {
+    "nconmax": getattr(sim_cfg, "nconmax", None), "njmax": getattr(sim_cfg, "njmax", None),
+    "contact_sensor_maxmatch": getattr(sim_cfg, "contact_sensor_maxmatch",
+                                      getattr(getattr(sim_cfg, "mujoco", None), "contact_sensor_maxmatch", None))}
+  for source, names in (("data", ("qpos", "qvel", "qacc", "ctrl", "actuator_force", "qfrc_actuator", "xfrc_applied")),
+                        ("model", ("body_mass", "body_inertia", "dof_damping", "actuator_gainprm", "actuator_biasprm"))):
+    container = getattr(sim, source, None)
+    if container is not None:
+      for name in names:
+        value = attempt(f"read_{source}.{name}", lambda c=container, n=name: getattr(c, n))
+        if value is not None:
+          fields[f"{source}.{name}"] = value
+  for name in ("episode_length_buf", "reset_buf", "reset_terminated", "reset_time_outs"):
+    value = getattr(real, name, None)
+    if value is not None:
+      fields[name] = value
+  count = getattr(real, "num_envs", None)
+  bad_ids, tensors = set(), {}
+  report["nonfinite_envs"] = {}
+  for name, value in fields.items():
+    value = getattr(value, "_tensor", value)  # mjlab's zero-copy TorchArray bridge.
+    if not isinstance(value, torch.Tensor):
+      continue
+    tensors[name] = value
+    if value.ndim > 0 and value.shape[0] == count:
+      def inspect_rows(v=value, n=name):
+        ids = (~torch.isfinite(v.detach()).reshape(count, -1).all(dim=1)).nonzero().flatten()
+        reported = ids[:4096].cpu().tolist()
+        report["nonfinite_envs"][n] = {"count": ids.numel(), "ids": reported, "truncated": ids.numel() > 4096}
+        bad_ids.update(reported)
+      attempt(f"nonfinite_{name}", inspect_rows)
+  selected = sorted(bad_ids)[:max_envs] if bad_ids else ([0] if count else [])
+  report["saved_env_ids"] = selected
+  report["selection"] = "first nonfinite envs" if bad_ids else "no nonfinite env identified; env0 diagnostic sample"
+  payload, total_bytes = {}, 0
+  report["tensor_fields"] = {}
+  for name, value in tensors.items():
+    def capture(v=value, n=name):
+      nonlocal total_bytes
+      per_env = v.ndim > 0 and v.shape[0] == count
+      elements = (v[0].numel() * len(selected)) if per_env and count else v.numel()
+      size = elements * v.element_size()
+      if total_bytes + size > max_tensor_bytes:
+        report["tensor_fields"][n] = {"skipped": "tensor byte budget", "bytes": size}
+        return
+      sample = (v.detach().index_select(0, torch.tensor(selected, device=v.device, dtype=torch.long))
+                if per_env else v.detach())  # Shared model arrays have no environment dimension.
+      payload[n] = sample.cpu().clone()
+      total_bytes += size
+      report["tensor_fields"][n] = {"shape": list(sample.shape), "dtype": str(sample.dtype), "bytes": size}
+    attempt(f"capture_{name}", capture)
+  if payload:
+    temporary = tensor_path.with_suffix(".pt.part")
+    def save_tensors():
+      try:
+        torch.save(payload, temporary)
+        temporary.replace(tensor_path)
+      finally:
+        temporary.unlink(missing_ok=True)
+    attempt("save_tensors", save_tensors)
+    if tensor_path.is_file():
+      report["tensor_artifact"] = {"path": tensor_path.name, "tensor_bytes": total_bytes,
+                                   "sha256": attempt("tensor_sha256", lambda: hashlib.sha256(tensor_path.read_bytes()).hexdigest())}
+  report["capture_complete"] = not errors
+  report["capture_finished"] = True
+  attempt("final_json", lambda: atomic_json(report_path, report))
+
+
 def train(args, record):
   import torch
   from mjlab.envs import ManagerBasedRlEnv
@@ -108,10 +308,19 @@ def train(args, record):
   if unsupported:
     raise ValueError("Not used by the whole-body runner: " + ", ".join(unsupported))
   context = distributed_context()
+  execution = getattr(args, "execution", "optimized")
+  optimized = execution != "standard"
   device = configure_local_device(context)
   torch.backends.cuda.matmul.allow_tf32 = True
   configure_torch_backends()
   task = TASKS[args.task]
+  if task.get("head_contract"):
+    if not args.resume or getattr(args,"start_from",None):
+      raise ValueError("Stage H requires --resume from the selected completed scan teacher or a head26 checkpoint")
+    from r1wb.head_task import contract_record
+    record.update(head_contract=contract_record(task["head_perception"],task["head_base"]))
+  if task.get("require_reward_ledger") and not getattr(args, "reward_ledger", False):
+    raise ValueError("The recovery contrast requires --reward-ledger in both arms")
   teacher = None
   if task.get("teacher"):
     if not args.teacher:
@@ -129,10 +338,22 @@ def train(args, record):
     if not start_from.is_file():
       raise ValueError(f"Start checkpoint not found: {start_from}")
   env_cfg = task["env"](teacher=str(teacher)) if teacher else task["env"]()
+  from r1wb.reward_contract import require_no_hit_exemptions
+  hit_time_contract = require_no_hit_exemptions(env_cfg)
+  record.update(hit_time_contract=hit_time_contract)
   env_cfg.scene.num_envs = args.num_envs
   env_cfg.seed = args.seed + context.rank * 100003
   agent = task["rl"]()
   agent.seed = args.seed
+  if getattr(args, "global_statistics", False):
+    if not hasattr(agent.algorithm, "global_statistics"):
+      raise ValueError("--global-statistics requires a whole-body ImitationPPO task")
+    agent.algorithm.global_statistics = True
+  global_statistics = bool(getattr(agent.algorithm, "global_statistics", False))
+  resume_next_iteration = bool(getattr(args, "resume_next_iteration", False))
+  failure_replay_buffer = bool(getattr(args, "failure_replay_buffer", False))
+  if resume_next_iteration and not args.resume:
+    raise ValueError("--resume-next-iteration requires --resume")
   if hasattr(agent.algorithm, "anchor_checkpoint"):
     agent.algorithm.anchor_checkpoint = str(teacher)
     if getattr(agent.algorithm, "repeat_weight", 0.0) > 0.0:
@@ -154,7 +375,9 @@ def train(args, record):
   # The app's automatic evaluation only knows the 810-input walking contract; these runs are evaluated by
   # the whole-body tools instead.
   record.update(iters=agent.max_iterations, render=False, pipeline="r1wb", stage=task["stage"],
-                mini_batches=int(agent.algorithm.num_mini_batches), ranks=context.world_size)
+                mini_batches=int(agent.algorithm.num_mini_batches), ranks=context.world_size,
+                execution=execution, global_statistics=global_statistics, resume_next_iteration=resume_next_iteration,
+                failure_replay_buffer=failure_replay_buffer)
   motion = env_cfg.commands.get("motion")
   if context.is_primary:
     snapshot_sources(log_dir)
@@ -182,7 +405,10 @@ def train(args, record):
       temporary = target.with_name("." + target.name + ".part")
       try:
         symmetric = {"symmetrized": True} if getattr(self.alg.get_policy(), "symmetrized", False) else {}
-        MjlabOnPolicyRunner.save(self, str(temporary), {**(infos or {}), "world_size": context.world_size, **symmetric})
+        MjlabOnPolicyRunner.save(self, str(temporary), {**(infos or {}), "world_size": context.world_size,
+                                                      "resume_next_iteration": resume_next_iteration,
+                                                      "failure_replay_buffer": failure_replay_buffer, **symmetric,
+                                                      **({"head_contract": "r1wb-head26-reference24-scan-v1"} if task.get("head_contract") else {})})
         temporary.replace(target)
       finally:
         temporary.unlink(missing_ok=True)
@@ -206,12 +432,41 @@ def train(args, record):
       record.update(iteration=iteration, checkpoint=target.name, policy=policy.name if policy.is_file() else None,
                     export_error=error)
 
-  env = None
+  env, runner, failure, replay_buffer, ledger = None, None, None, None, None
   try:
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    if task.get("head_contract"):
+      from r1wb.head_task import validate_env
+      record.update(head_env_contract=validate_env(env))
+    if optimized:
+      from r1wb.performance import install_read_cache
+      install_read_cache(env)
+    if execution in ("compacted", "optimized"):
+      from r1wb.performance import install_fast_resets, install_reference_tables
+      from r1wb.collision_batch import install_collision_batching
+      install_fast_resets(env)
+      install_reference_tables(env)
+      install_collision_batching(env.sim, group_by_geom=execution == "optimized",
+                                parallel_cells=execution == "optimized")
     record.update(self_collision=ensure_robot_self_collision(env))
+    if task.get("wholebody_calm"):
+      from r1wb import wholebody_calm
+      wholebody_calm.install(env)
+      record.update(wholebody_calm_contract=wholebody_calm.contract_record(task["calm_cell"]))
     env = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
     agent_cfg = asdict(agent)
+    if optimized:
+      from rsl_rl.utils import resolve_callable
+      from r1wb.learning import ImitationPPO
+      if issubclass(resolve_callable(agent_cfg["algorithm"]["class_name"]), ImitationPPO):
+        agent_cfg["algorithm"]["defer_metrics"] = True
+        from r1wb.student.observations import no_label
+        group = env_cfg.observations.get(agent_cfg["algorithm"].get("bc_group", "bc"))
+        label = next(iter(group.terms.values())) if group is not None and len(group.terms) == 1 else None
+        if (label is not None and label.func is no_label and not group.enable_corruption
+            and label.clip is None and not getattr(label, "modifiers", None)):
+          # This explicit observation contract always supplies zero driven flags.
+          agent_cfg["algorithm"]["teacher_driven"] = False
     if context.is_primary:
       dump_yaml(log_dir / "params" / "env.yaml", asdict(env_cfg))
       dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
@@ -234,14 +489,10 @@ def train(args, record):
         with torch.no_grad():
           runner.alg.actor.distribution.std_param[12:] *= float(task["upper_noise_scale"])
     if args.resume:
-      source = widened(args.resume, runner, log_dir, device) if task.get("pad_inputs") else args.resume
-      runner.load(source, map_location=device)
-      if source != args.resume:
-        Path(source).unlink(missing_ok=True)
-        if context.is_primary:
-          record.update(resume_widened=True)
-      if task.get("init_from_teacher"):
-        runner.alg.actor.obs_normalizer.until = 0
+      resume_info = resume_training(runner, args.resume, log_dir, device, pad_inputs=bool(task.get("pad_inputs")),
+                                    freeze_actor_normalizer=bool(task.get("init_from_teacher")),
+                                    next_iteration=resume_next_iteration, head_contract=bool(task.get("head_contract")))
+      record.update(**resume_info)
     start = int(runner.current_learning_iteration)
     record.update(state="running", start_iteration=start, total_iterations=start + agent.max_iterations,
                   actor_observation_dimension=int(runner.alg.get_policy().obs_dim), started_at=time.time())
@@ -249,17 +500,109 @@ def train(args, record):
 
     def update():
       result = native_update()
+      if ledger is not None and task.get("strict_reward_ledger"):
+        status = ledger.summary()
+        quality = status["quality"]
+        if (not ledger.active or status["errors"] or quality["nonfinite_classifications"]
+            or quality["force_available_frames"] != status["steps_written"]
+            or quality["sum_exact_frames"] != status["steps_written"]):
+          raise RuntimeError("Required recovery ledger failed or stopped before the training horizon: " + str(status))
       if context.is_primary and runner.current_learning_iteration % 10 == 0:
         record.update(iteration=int(runner.current_learning_iteration))
       return result
 
     runner.alg.update = update
+    if context.is_primary:
+      from r1wb.performance import record_iteration_times
+      record_iteration_times(runner, log_dir / "performance.jsonl")
+    if failure_replay_buffer:
+      from r1wb.eval.failure_snapshot import install_failure_replay_buffer
+      replay_buffer = install_failure_replay_buffer(env.unwrapped, log_dir, context.rank, enabled=True)
+      replay_buffer.metadata["run"] = {key: record.info.get(key) for key in
+                                        ("id", "task", "seed", "execution", "ranks", "resume", "resume_sha256")}
+      record.update(failure_replay_status=replay_buffer.status())
+    if getattr(args, "reward_ledger", False):
+      from r1wb.reward_ledger import LedgerOptions, PureVectorDiagnostic, attach
+      raw_env = env.unwrapped
+      compact = task.get("ledger_profile") == "compact_v2"
+      if compact:
+        from r1wb.recovery import DIAGNOSTIC_COLUMNS, diagnostic_values
+        suffix = ".jsonl.gz"
+        options = LedgerOptions(
+          flush_every=24, max_steps=agent.max_iterations * agent.num_steps_per_env,
+          max_file_bytes=128 * 1024**2, compression="gzip", compact=True,
+          pure_vector_diagnostics={"recovery_risk": PureVectorDiagnostic(
+            callback=lambda: diagnostic_values(raw_env), columns=DIAGNOSTIC_COLUMNS,
+            compare_max=("tilt", "predicted_tilt"), valid_column="valid")})
+        if task.get("head_contract"):
+          from r1wb import head_rewards
+          options = __import__("dataclasses").replace(options, pure_vector_diagnostics={
+            **options.pure_vector_diagnostics, "head_view": PureVectorDiagnostic(
+              callback=lambda: head_rewards.diagnostic_values(raw_env), columns=head_rewards.DIAGNOSTIC_COLUMNS,
+              valid_column="valid")})
+        if task.get("wholebody_calm"):
+          from r1wb import wholebody_calm
+          options = __import__("dataclasses").replace(options, pure_vector_diagnostics={
+            **options.pure_vector_diagnostics, "wholebody_calm": PureVectorDiagnostic(
+              callback=lambda: wholebody_calm.diagnostic_values(raw_env),
+              columns=wholebody_calm.DIAGNOSTIC_COLUMNS, valid_column="history_valid")})
+      else:
+        diagnostics = {}
+        if "recovery_risk" in env_cfg.rewards:
+          from r1wb.recovery import recovery_invalid, recovery_risk
+          diagnostics["recovery_risk"] = lambda: recovery_risk(raw_env)
+          diagnostics["recovery_invalid"] = lambda: recovery_invalid(raw_env)
+        suffix = ".jsonl"
+        options = LedgerOptions(flush_every=24, max_steps=agent.max_iterations * agent.num_steps_per_env,
+                                max_file_bytes=256 * 1024**2, pure_diagnostics=diagnostics)
+      ledger = attach(raw_env, log_dir / f"reward_ledger_rank{context.rank}{suffix}", options)
+      native_act = runner.alg.act
+
+      def audited_act(observations):
+        actions = native_act(observations)
+        ledger.record_critic(runner.alg.transition.values, observation_step=int(raw_env.common_step_counter),
+                             phase="pre_action")
+        return actions
+
+      runner.alg.act = audited_act
+      record.update(reward_ledger={"enabled": True, "path_pattern": "reward_ledger_rank*" + suffix,
+                                  "max_bytes_per_rank": options.max_file_bytes,
+                                  "max_steps_per_rank": agent.max_iterations * agent.num_steps_per_env,
+                                  "trace_envs_per_rank": min(4, raw_env.num_envs),
+                                  "compression": options.compression, "compact": options.compact})
     runner.learn(num_learning_iterations=agent.max_iterations, init_at_random_ep_len=True)
     record.update(iteration=int(runner.current_learning_iteration))
     if context.is_distributed:
       torch.distributed.barrier()
+  except Exception as error:
+    failure = error
+    try:
+      record_training_failure(error, record, env, runner, context)
+    except BaseException as diagnostic_error:
+      try:
+        print(f"[WARN] Failure evidence could not be completed: {diagnostic_error}", flush=True)
+      except Exception:
+        pass
+    raise
   finally:
-    if env is not None:
-      env.close()
-    if torch.distributed.is_initialized():
-      torch.distributed.destroy_process_group()
+    for close in (((ledger.close,) if ledger is not None else ())
+                  + ((replay_buffer.close,) if replay_buffer is not None else ())
+                  + ((env.close,) if env is not None else ())
+                  + (lambda: torch.distributed.destroy_process_group() if torch.distributed.is_initialized() else None,)):
+      try:
+        close()
+      except BaseException as cleanup_error:
+        if failure is None:
+          raise
+        try:
+          print(f"[WARN] Cleanup failed after {type(failure).__name__}: {cleanup_error}", flush=True)
+        except Exception:
+          pass
+    if ledger is not None:
+      status = ledger.summary()
+      record.update(reward_ledger_status=status)
+      if failure is None and task.get("strict_reward_ledger"):
+        expected = agent.max_iterations * agent.num_steps_per_env
+        if (not status["final_success"] or status["quality"]["critic_supplied_frames"] != expected
+            or status["quality"]["vector_frames"].get("recovery_risk", 0) != expected):
+          raise RuntimeError("Recovery training finished without its complete required ledger: " + str(status))

@@ -2,7 +2,7 @@
 name = "careful_walk_action_manager"
 version = "0.1.0"
 edition = "2021"
-description = "R1 careful walking policy action"
+description = "R1 careful walking: SONIC-R1 tracker on the baked calm v4.3s reference"
 publish = false
 
 [[bin]]
@@ -15,7 +15,9 @@ ros = ["walking_action_manager/ros"]
 
 [dependencies]
 walking_action_manager = { path = "../walking_action_manager", default-features = false }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [package.metadata.ros]
-install_to_share = ["launch", "config"]
+install_to_share = ["launch"]

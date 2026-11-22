@@ -20,6 +20,8 @@ import json
 import math
 import os
 from pathlib import Path
+import random
+import shutil
 import sys
 import time
 
@@ -150,6 +152,17 @@ def main():
                       help="residual: build the environment of this registered task instead of the plain "
                            "correction with --arm-base-scale")
   parser.add_argument("--tag", default="", help="suffix of the result file name (diagnostic variants)")
+  parser.add_argument("--comparison-contract", choices=["native-r1", "proper-r1-v1"], default=None,
+                      help="opt-in physical-command comparison: shared timing/initial library, native manufacturer slew")
+  parser.add_argument("--observation-profile", choices=["N0", "N1_shared_sensor_v1"], default="N0")
+  parser.add_argument("--sensor-seeds", type=Path, default=None, help="proper-r1-v1: JSON environment noise_seeds")
+  parser.add_argument("--command-pack", type=Path, default=None, help="proper-r1-v1 frozen command and physical initial cases")
+  parser.add_argument("--command-pack-smoke", action="store_true", help="explicitly excluded instrumentation subset")
+  parser.add_argument("--actor-trace", type=Path, default=None, help="proper-r1-v1: new trace directory; video archive owns its actor_inputs subdirectory")
+  parser.add_argument("--manufacturer-bundle", type=Path, default=None,
+                      help="evaluation-only portable manufacturer manifest/directory; all artifact hashes are verified")
+  parser.add_argument("--seed", type=int, default=None)
+  parser.add_argument("--protocol", type=Path, default=None, help="preregistered comparison protocol to preserve with the result")
   parser.add_argument("--anchor", type=Path, default=None,
                       help="student: also report the mean |action - action of this checkpoint on the same observation| "
                            "(how far a policy continued from that checkpoint has moved in undisturbed motion)")
@@ -214,8 +227,43 @@ def main():
   parser.add_argument("--seconds", type=float, default=20.0)
   parser.add_argument("--app-pid", type=int, required=True)
   parser.add_argument("--no-video", action="store_true", help="smoke runs only; real evaluations keep the archive")
+  parser.add_argument("--archive-compression", action="store_true",
+                      help="lossless NPZ compression for state transport; trajectory and sampling stay unchanged")
   parser.add_argument("--device", default="cuda:0")
   args = parser.parse_args()
+  from r1wb.eval.shared_sensor_observation import validate_profile_options
+  try:
+    proper = validate_profile_options(args)
+  except ValueError as error:
+    parser.error(str(error))
+  command_pack = None
+  if args.command_pack is not None:
+    from r1wb.eval.case_pack import load_command_pack
+    command_pack = load_command_pack(args.command_pack, args, allow_subset=args.command_pack_smoke)
+  if proper and command_pack is None:
+    parser.error("proper-r1-v1 requires a sealed --command-pack")
+  comparison = args.comparison_contract in ("native-r1", "proper-r1-v1")
+  if comparison:
+    if args.policy not in ("manufacturer", "s2") or args.suite != "compass":
+      parser.error("native-r1 supports --suite compass with manufacturer or s2")
+    if args.seed is None or not args.tag or args.protocol is None or not args.protocol.is_file():
+      parser.error("native-r1 requires --seed, a unique --tag and an existing --protocol")
+    if args.policy == "s2" and (args.head != "h12" or args.tokens != "v2d"):
+      parser.error("native-r1 fixes the app route: --head h12 --tokens v2d")
+    if (args.library not in ("", "corebal") or args.ground_reference not in ("", "feet") or
+        args.variant != "train" or args.replay or args.goal_model or args.backbone or args.progress_feedback or
+        args.s2 or args.anchor or args.chunk or args.plan_lean or args.course_set):
+      parser.error("native-r1 fixes corebal/feet, clean physics and table goals (no replay/diagnostic feedback)")
+    if args.stagger < 0 or not math.isclose(args.stagger / 0.32, round(args.stagger / 0.32), abs_tol=1e-8):
+      parser.error("native-r1 stagger must be a multiple of the 0.32 s S2 decision period")
+    args.library, args.ground_reference = "corebal", "feet"
+    args.world = args.world or "flat"
+  if args.manufacturer_bundle is not None and args.policy != "manufacturer":
+    parser.error("--manufacturer-bundle is evaluation-only and requires --policy manufacturer")
+  if args.seed is not None:
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
   os.environ["RL_EVALUATION_APP_PID"] = str(args.app_pid)
   from r1wb.eval.evaluation_video import require_app_owner
   require_app_owner(bind=True)
@@ -223,7 +271,7 @@ def main():
   manufacturer = args.policy == "manufacturer"
   if manufacturer:
     from r1wb.eval.manufacturer import load as load_manufacturer
-    MANUFACTURER, ManufacturerPolicy = load_manufacturer()
+    MANUFACTURER, ManufacturerPolicy = load_manufacturer(args.manufacturer_bundle, reset_history=comparison)
     checkpoint, iteration = MANUFACTURER, 0
   else:
     checkpoint = (args.checkpoint or max(run.glob("model_*.pt"), key=lambda p: int(p.stem.split("_")[1]))).resolve()
@@ -236,6 +284,20 @@ def main():
     spoken = compass_instructions()
     suite = {name: [instructions.command_row(item, seconds - 0.01) for item, seconds in script]
              for name, script in spoken.items()}
+  support = None
+  if comparison:
+    from r1wb.eval.command_contract import NativeCommand, PhysicalSchedule, comparison_support, native_model, physical_suite
+    from r1wb.s2 import instructions
+    from r1wb.s2.small import GRID_ORIGIN
+    spoken = compass_instructions()
+    suite = physical_suite(spoken, instructions.command_row, grid_origin=GRID_ORIGIN)
+    support = {name: comparison_support(script) for name, script in suite.items()}
+  if command_pack is not None:
+    suite = {r["block_id"]: [[steps * 0.02, vx, vy, wz, 0.731, 0., 0., 0.] for steps, vx, vy, wz in script]
+             for r, script in zip(command_pack.rows, command_pack.scripts, strict=True)}
+    args.repeats, args.stagger = 1, 0.0
+    args.seconds = command_pack.horizon * 0.02
+    support = {name: comparison_support(script) for name, script in suite.items()}
   if args.suite == "sweep":
     args.seconds = min(args.seconds, 14.0)
   names = list(suite)
@@ -257,6 +319,13 @@ def main():
   else:
     cfg = stream_env_cfg(play=True, clean=args.variant != "hardened", plain_actions=manufacturer,
                          matched=label or args.matched, teacher=str(checkpoint) if label else None)
+  if args.seed is not None:
+    cfg.seed = args.seed
+  if comparison:
+    from r1wb.tracking.env_cfg import library_path
+    from r1wb.student.stream import stand_clips
+    cfg.commands["motion"].motion_file = str(library_path("corebal"))
+    cfg.commands["motion"].clip_list = stand_clips(cfg.commands["motion"].motion_file)
   if args.policy == "s2" and args.backbone is not None:        # a vision-language model looks through the head camera
     from r1wb.s2.collect import head_camera
     cfg.scene.sensors = tuple(cfg.scene.sensors) + (head_camera(224),)
@@ -277,32 +346,65 @@ def main():
   if args.world:
     from r1wb import world
     world.apply_ground(cfg, args.world)
+  if command_pack is not None:
+    command_pack.configure_cfg(cfg)
   env = ManagerBasedRlEnv(cfg=cfg, device=args.device)
   wrapped = RslRlVecEnvWrapper(env)
   term = env.command_manager.get_term("motion")
   if args.ground_reference:
     assert args.world, "--ground-reference needs --world"
-    world.ground_reference(env, term, args.ground_reference)   # (a System 2 view built below is raised too: the policy reads it)
+    if not proper:
+      world.ground_reference(env, term, args.ground_reference)   # (a System 2 view built below is raised too: the policy reads it)
   if args.plan_lean != 0.0:
     from r1wb.eval.diagnostics import lean_standing_plan
     assert args.policy == "label", "--plan-lean changes the library's plan (generator-driven runs)"
     print(f"plan lean {args.plan_lean:+g} rad on {100.0 * lean_standing_plan(term, env.scene['robot'], args.plan_lean):.1f}% of the library's frames")
   longest = max(len(script) for script in suite.values())
   table = torch.zeros(count, longest, 8)
+  actual_scripts = []
   for index in range(count):
     script = [list(row) for row in suite[names[index // args.repeats]]]
     for row in script:
       if args.stagger > 0.0 and moving(row):
         row[0] += args.stagger * (index % args.repeats)
+    actual_scripts.append(script)
     rows = script + [seg(1.0e6, *script[-1][1:4])] * (longest - len(script))
     table[index] = torch.tensor(rows)
     table[index, len(script) - 1, 0] = 1.0e6                     # hold the last segment
   term.set_script(table)
   env.reset()
+  initialization_qa = command_pack.initialize(env, term) if command_pack is not None else None
+  common_command = None
+  if proper:
+    from r1wb.eval.case_pack import apply_ground_reference
+    from r1wb.eval.common_command import CommonCommand
+    apply_ground_reference(env, term)
+    common_command = CommonCommand(torch.zeros(count, 3, device=env.device), float(env.step_dt))
+  physical = PhysicalSchedule(actual_scripts, device=env.device, dt=float(env.step_dt)) if comparison else None
+  native_command = NativeCommand(torch.zeros(count, 3, device=env.device), float(env.step_dt)) if comparison and manufacturer else None
   observation = wrapped.get_observations()
   steerer = None
   if manufacturer:
     policy = ManufacturerPolicy(env, term.twist_goal())
+  elif proper and args.policy == "s2":
+    from tensordict import TensorDict
+    from r1wb.s2.runtime import S2View, goal_brain
+    from r1wb.s2.small import SmallS2
+    from r1wb.s2.tokenizer import MotionTokenizer
+    from r1wb.student.observations import load_teacher
+    from r1wb.tracking.env_cfg import teacher_observation
+    tokenizer = MotionTokenizer.load(WORK / "data/s2" / f"tokenizer_{args.tokens}.pt", args.device)
+    mind = SmallS2.load(WORK / "data/s2" / f"small_{args.head}.pt", args.device)
+    goal_template = torch.zeros(count, 5, device=env.device)
+    goal_template[:, 3] = term.cfg.default_height
+    view = S2View(env, term, goal_brain(mind, lambda decision: common_command.goal(goal_template)), tokenizer)
+    tracker = load_teacher(str(checkpoint), args.device)
+    joint_action = env.action_manager.get_term("joint_pos")
+
+    def policy(obs):
+      common_command.update_view(view)
+      seen = teacher_observation(view.env, "motion", joint_action.plain_action, local=True, width=tracker.obs_dim)
+      return joint_action.from_plain_action(tracker(TensorDict({"actor": seen}, batch_size=[seen.shape[0]])))
   elif args.policy == "s2":
     import random as _random
 
@@ -434,7 +536,10 @@ def main():
 
   reader = locals().get("view", term)                        # what System 1's observation reads the plan from
   if args.ground_reference and reader is not term:
-    world.ground_reference(env, reader, args.ground_reference)
+    if proper:
+      apply_ground_reference(env, reader)
+    else:
+      world.ground_reference(env, reader, args.ground_reference)
   if args.steer and args.policy == "label":                   # (with --policy s2 it stands in front of the code head)
     from r1wb.s2.steer import PERIOD as STEER_PERIOD, Steer, SteerPolicy
     steer_policy = SteerPolicy.load(WORK / "data/s2" / f"steer_{args.steer}.pt", args.device)
@@ -490,11 +595,16 @@ def main():
     tag += f"_world-{args.world}" + (f"-gref{args.ground_reference}" if args.ground_reference else "")
   if args.tag:
     tag += "_" + args.tag
+  if comparison:
+    tag += "_native-r1"
+    if (out_dir / f"{tag}.json").exists() or (out_dir / f"{tag}.commands.npz").exists():
+      raise FileExistsError(f"Comparison result already exists: {tag}")
   archive = None
   if not args.no_video:
     from r1wb.eval.vector_evaluation_video import VectorVideoArchive, destination
     labels = [f"{names[i // args.repeats]}_{i % args.repeats}" for i in range(count)]
-    archive = VectorVideoArchive(env, destination(run / f"policy_{iteration}.onnx", out_dir / f"{tag}.json"), labels)
+    archive = VectorVideoArchive(env, destination(run / f"policy_{iteration}.onnx", out_dir / f"{tag}.json"), labels,
+                                 compressed=args.archive_compression)
     archive.manifest.update(evaluator=__file__, result_json=str(out_dir / f"{tag}.json"),
                             evaluation_args=dict({k: str(v) for k, v in vars(args).items()}, checkpoint=str(checkpoint)),
                             checkpoint_sha256=hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
@@ -502,6 +612,80 @@ def main():
     archive.begin()
     if not archive.started:
       raise RuntimeError(archive.manifest.get("reason", "Cannot preserve evaluation"))
+  comparison_metadata = None
+  if comparison:
+    from r1wb.eval.command_contract import NATIVE_DELTAS, NATIVE_LIMITS
+    asset_files = [checkpoint, Path(term.cfg.motion_file), Path(term.cfg.motion_file).with_suffix(".manifest.json"),
+                   library_path("core"), library_path("core").with_suffix(".manifest.json"), args.protocol.resolve()]
+    if command_pack is not None:
+      asset_files += [command_pack.path, args.sensor_seeds.resolve()]
+    bundle_metadata = getattr(ManufacturerPolicy, "bundle_metadata", None) if manufacturer else None
+    if manufacturer:
+      asset_files.append(Path(ManufacturerPolicy.wrapper_path))
+      if bundle_metadata:
+        asset_files += [Path(entry["source"]) for entry in bundle_metadata["assets"]]
+        asset_files.append(Path(bundle_metadata["manifest"]))
+      else:
+        proof_path = Path(checkpoint).with_suffix(".provenance.json")
+        asset_files.append(proof_path)
+        asset_files.append(Path(json.loads(proof_path.read_text())["source_onnx"]))
+    else:
+      asset_files += [WORK / "data/s2" / f"small_{args.head}.pt", WORK / "data/s2" / f"tokenizer_{args.tokens}.pt"]
+      if args.steer:
+        asset_files.append(WORK / "data/s2" / f"steer_{args.steer}.pt")
+    shared = WORK / "result/video/_assets"
+    shared.mkdir(parents=True, exist_ok=True)
+    assets = []
+    for asset in dict.fromkeys(asset_files):
+      with asset.open("rb") as source_file:
+        digest = hashlib.file_digest(source_file, "sha256").hexdigest()
+      saved = shared / (digest + asset.suffix)
+      if not saved.exists():
+        shutil.copyfile(asset, saved)
+      assets.append(dict(source=str(asset), sha256=digest, snapshot=str(saved)))
+    source_dir = (archive.directory if archive is not None else out_dir / f"{tag}.artifacts") / "sources"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    sources = {}
+    for source in (ROOT / "src/r1wb").rglob("*.py"):
+      content = source.read_bytes()
+      digest = hashlib.sha256(content).hexdigest()
+      saved = source_dir / (digest + "_" + source.name)
+      saved.write_bytes(content)
+      sources[str(source)] = dict(sha256=digest, snapshot=str(saved))
+    comparison_metadata = dict(
+      name=args.comparison_contract, version=1, score_target="unfiltered physical instruction sampled before each action",
+      command_layers=dict(manufacturer="native physical low-speed slew once; no joystick mapping",
+                          s2="unchanged h12/tokenizer/optional learned steer and S2 goal governor"),
+      native_deltas_per_20ms=NATIVE_DELTAS, native_limits=NATIVE_LIMITS,
+      seed=args.seed, initial_library="corebal", human_reference_library="core", hand_mass_kg_each=robot.HAND_MASS,
+      head=args.head if not manufacturer else None, tokens=args.tokens if not manufacturer else None,
+      steer=args.steer or None, ground_reference=args.ground_reference, supported_scripts=support,
+      schedule_dt=float(env.step_dt), actual_scripts=actual_scripts, assets=assets, sources=sources,
+      manufacturer_bundle=bundle_metadata,
+      initial_state=dict(joint_pos=entity.data.joint_pos.cpu().tolist(), joint_vel=entity.data.joint_vel.cpu().tolist(),
+                         root_position=(entity.data.root_link_pos_w - env.scene.env_origins).cpu().tolist(),
+                         root_quaternion=entity.data.root_link_quat_w.cpu().tolist(),
+                         reference_frames=term.time_steps.cpu().tolist()))
+    if proper:
+      comparison_metadata.update(command_adapter=common_command.metadata(), initialization=initialization_qa,
+                                 command_pack_sha256=command_pack.digest, instrumentation_only=args.command_pack_smoke)
+    comparison_metadata["initial_state_sha256"] = hashlib.sha256(
+      json.dumps(comparison_metadata["initial_state"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if archive is not None:
+      archive.manifest["comparison_contract"] = comparison_metadata
+      archive.manifest["model_assets"] = assets
+      archive.manifest["source_snapshot"].update(sources)
+      archive.localize_assets()
+  sensor_hook = None
+  if proper:
+    from r1wb.eval.shared_sensor_observation import install_sensor_hook, trace_context
+    sensor_hook = install_sensor_hook(env, policy.model if manufacturer else tracker, args, archive,
+                                       kind="manufacturer" if manufacturer else "teacher",
+                                       command=None if manufacturer else view,
+                                       to_policy=policy.to_policy if manufacturer else None)
+    comparison_metadata["observation_contract"] = sensor_hook.stream.metadata
+    if command_pack is not None:
+      sensor_hook.trace.manifest["metadata"]["episode_control_steps"] = command_pack.episode_steps
   zeros = lambda *shape: torch.zeros(*shape, device=env.device)  # noqa: E731
   # How human the motion is: at every step the robot's pose (leg and waist joint angles, pelvis height and tilt) is
   # compared with the closest pose of the retargeted human captures (the motion library), and the same joints'
@@ -513,10 +697,16 @@ def main():
     from r1wb.s2 import frames as s2f
     table = s2f.library_frames(term.motion, term.motion_anchor_body_index, term.clip_end[term.frame_clip])
     plan_table = table
+    human_motion = term.motion
+    if comparison:
+      from r1wb.library import Library
+      human_motion = Library(library_path("core"), tuple(term.cfg.body_names), device=env.device)
+      table = s2f.library_frames(human_motion, term.motion_anchor_body_index,
+                                human_motion.clip_end[human_motion.frame_clip])
     weight = torch.ones(27, device=env.device)
     weight[14:24] = 0.0                                        # arms: not captured motion
     weight[24] = 2.0                                           # pelvis height: 0.05 m <-> 0.1 rad
-    human = dict(pose=table[:, :27] * weight, weight=weight, velocity=term.motion.joint_vel,
+    human = dict(pose=table[:, :27] * weight, weight=weight, velocity=human_motion.joint_vel,
                  norm=(table[:, :27] * weight).pow(2).sum(1))
   totals_human = {key: zeros(count) for key in ("walk_steps", "walk_pose", "walk_velocity", "stand_steps", "stand_pose")}
   # The gait itself, from the leg joints alone (the same numbers can be taken from a human capture): how often the
@@ -580,9 +770,19 @@ def main():
   peak_ground = torch.zeros(count, device=env.device)     # ... its largest size while the robot was up
   read_gap, read_steps = torch.zeros(count, device=env.device), torch.zeros(count, device=env.device)
   slope_quiet, slope_landings = torch.zeros(count, device=env.device), torch.zeros(count, device=env.device)
+  command_trace = {key: [] for key in ("step", "raw_target", "effective_twist", "alive_before", "required_native_model")} if comparison else None
+  episode_steps = torch.tensor(command_pack.episode_steps, device=env.device) if command_pack is not None else None
   for step in range(horizon):
+    if episode_steps is not None:
+      alive &= step < episode_steps
+    if comparison:
+      physical_row, physical_age, physical_left = physical.sample(step)
+    if common_command is not None:
+      common_command.advance(step, physical_row[:, 1:4])
     if manufacturer:
-      policy.twists = term.twist_goal()
+      policy.twists = common_command.delivered if proper else (native_command.step(physical_row[:, 1:4]) if comparison else term.twist_goal())
+    if sensor_hook is not None:
+      sensor_hook.begin(step, **trace_context(env, alive, requested_twist=physical_row[:, 1:4]))
     with torch.no_grad():
       if steerer is not None and steerer.generator and step % steer_policy.period == 0:
         steerer.act(steer_policy.best(steerer.observe()))
@@ -590,7 +790,18 @@ def main():
       if anchor is not None:
         apart = (action - anchor(torch.cat([observation["actor"], observation["goal"]], dim=1))).abs()
         anchor_sum += torch.stack([apart[:, :12].mean(1), apart[:, 12:14].mean(1), apart[:, 14:].mean(1)], dim=1) * alive.float().unsqueeze(1)
+    if sensor_hook is not None:
+      sensor_hook.finish()
+    if command_trace is not None:
+      effective = policy.twists if manufacturer else view.goal[:, :3]
+      command_trace["step"].append(step)
+      command_trace["raw_target"].append(physical_row[:, 1:].cpu().numpy().copy())
+      command_trace["effective_twist"].append(effective.cpu().numpy().copy())
+      command_trace["alive_before"].append(alive.cpu().numpy().copy())
+      command_trace["required_native_model"].append(native_model(effective).cpu().numpy())
     observation, _, dones, _ = wrapped.step(action)
+    if sensor_hook is not None:
+      sensor_hook.after_step(dones, env.termination_manager.terminated, alive)
     if steerer is not None:
       steerer.progress.after_step()
     if archive is not None:
@@ -610,18 +821,26 @@ def main():
       limit = term.slew[:3] * dt
       shadow += torch.maximum(torch.minimum(told - shadow, limit), -limit)
       goal = shadow.clone()
+    if comparison:
+      goal = physical_row[:, 1:4]
     smooth = twist.clone() if smooth is None else smooth + (twist - smooth) * (dt / 0.4)
     settled = alive & (term.since_change > 1.0)
+    if comparison:
+      settled = alive & (physical_age > 1.0)
     # Asked to stand for 1.5 s already, and not within 0.5 s of the next change of the script: System 2 is given an
     # instruction one decision (0.32 s) before the script's time so that the motion begins on time, and the first
     # footfall of that motion is not "moving while asked to stand".
     quiet = (alive & (term.since_change > 1.5) & (torch.norm(term.stream_target[:, :3], dim=1) < 1e-6)
              & (term.segment_left > 0.5))
+    if comparison:
+      quiet = alive & (physical_age > 1.5) & (torch.norm(goal, dim=1) < 1e-6) & (physical_left > 0.5)
     totals["steps"] += live
     totals["settled"] += settled.float()
     totals["twist_error"] += torch.norm(smooth[:, :2] - goal[:, :2], dim=1) * settled.float()
     totals["yaw_error"] += (smooth[:, 2] - goal[:, 2]).abs() * settled.float()
     height_on = alive & (term.goal_mask[:, 1] > 0) & (term.since_change > 1.5)
+    if comparison:
+      height_on = alive & (physical_row[:, 5] > 0) & (physical_age > 1.5)
     height = world.root_height(env) if args.world else data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
     if args.world:
       under = world.ground_under(env)
@@ -632,7 +851,8 @@ def main():
         read_gap += (reader.anchor_pos_w[:, 2] - term.robot_anchor_pos_w[:, 2]) * away.float()
         read_steps += away.float()
     totals["height_steps"] += height_on.float()
-    totals["height_error"] += (height - term.stream[:, 3]).abs() * height_on.float()
+    height_goal = physical_row[:, 4] if comparison else term.stream[:, 3]
+    totals["height_error"] += (height - height_goal).abs() * height_on.float()
     odometry += twist * dt * live.unsqueeze(1)
     commanded += goal * dt * live.unsqueeze(1)
     end_pos = torch.where(alive.unsqueeze(1), data.root_link_pos_w[:, :2], end_pos)
@@ -707,6 +927,9 @@ def main():
       velocity_gap = (data.joint_vel - human["velocity"][nearest])[:, :14].pow(2).mean(1).sqrt()   # rad/s RMS, legs + waist
       walking = alive & (torch.norm(term.stream_target[:, :3], dim=1) > 1e-6) & (term.since_change > 1.5)
       standing = alive & (torch.norm(term.stream_target[:, :3], dim=1) < 1e-6) & (term.since_change > 1.5)
+      if comparison:
+        walking = alive & (torch.norm(goal, dim=1) > 1e-6) & (physical_age > 1.5)
+        standing = alive & (torch.norm(goal, dim=1) < 1e-6) & (physical_age > 1.5)
       totals_human["walk_steps"] += walking.float(); totals_human["walk_pose"] += pose_gap * walking.float()
       totals_human["walk_velocity"] += velocity_gap * walking.float()
       totals_human["stand_steps"] += standing.float(); totals_human["stand_pose"] += pose_gap * standing.float()
@@ -737,7 +960,7 @@ def main():
     totals["outside_band"] += (margin > dynamics.MARGIN_DEAD_BAND).float() * live
     totals["one_step"] += ((margin > 0.0) & (one_step > dynamics.DEAD_BAND)).float() * live
     totals["quiet_outside"] += (margin > 0.0).float() * quiet.float()
-    moving_now = torch.norm(term.told[:, :3], dim=1) > 1e-6
+    moving_now = torch.norm(goal if comparison else term.told[:, :3], dim=1) > 1e-6
     ended, begun = stopping & (moving_now | ~alive), alive & ~moving_now & told_moving
     if ended.any():
       close_stops(ended)
@@ -859,38 +1082,52 @@ def main():
     by_script[name]["falls"] = sum(r["fell"] for r in group)
     worst = max(group, key=lambda r: r["torque_ratio_max"])
     by_script[name].update(torque_ratio_peak=worst["torque_ratio_max"], torque_peak_actuator=worst["torque_peak_actuator"])
-  scored = [r for r in rows if not (manufacturer and r["script"] in USES_HEIGHT)]
-  quiet_minutes = float(totals["quiet_steps"].sum()) * dt / 60.0
+  if comparison:
+    for i, row in enumerate(rows):
+      row.update(comparison_supported=support[row["script"]]["supported"],
+                 comparison_exclusion_reasons=support[row["script"]]["reasons"],
+                 observed_s=round(float(totals["steps"][i]) * dt, 6),
+                 completed=(not row["fell"] and int(totals["steps"][i]) == command_pack.episode_steps[i]) if command_pack is not None else bool(alive[i]), quiet_observed_s=round(float(totals["quiet_steps"][i]) * dt, 6))
+    for name in names:
+      by_script[name]["comparison_support"] = support[name]
+  scored = ([r for r in rows if r["comparison_supported"]] if comparison else
+            [r for r in rows if not (manufacturer and r["script"] in USES_HEIGHT)])
+  aggregate = scored if comparison else rows
+  selected_ids = [i for i, row in enumerate(rows) if not comparison or row["comparison_supported"]]
+  quiet_steps = totals["quiet_steps"][selected_ids].sum()
+  quiet_landings = totals["quiet_touchdowns"][selected_ids].sum()
+  quiet_minutes = float(quiet_steps) * dt / 60.0
+  summary_stops = [stop for stop in stops if not comparison or support[stop["script"]]["supported"]]
   summary = dict(
-    episodes=count, falls=sum(r["fell"] for r in rows), fell_scripts=sorted({r["script"] for r in rows if r["fell"]}),
+    episodes=len(aggregate), falls=sum(r["fell"] for r in aggregate), fell_scripts=sorted({r["script"] for r in aggregate if r["fell"]}),
     twist_error_mps=mean([r["twist_error_mps"] for r in scored]), yaw_rate_error_rps=mean([r["yaw_rate_error_rps"] for r in scored]),
     distance_ratio=mean([r["distance_ratio"] for r in scored]), yaw_ratio=mean([r["yaw_ratio"] for r in scored]),
     distance_ratio_min=min([r["distance_ratio"] for r in scored if r["distance_ratio"] is not None], default=None),
     path_ratio=mean([r["path_ratio"] for r in scored]), direction_error_deg=mean([r["direction_error_deg"] for r in scored]),
     heading_drift_deg=mean([r["heading_drift_deg"] for r in scored]), end_miss_m=mean([r["end_miss_m"] for r in scored]),
-    height_error_m=None if manufacturer else mean([r["height_error_m"] for r in rows]),
-    quiet_touchdowns=int(totals["quiet_touchdowns"].sum()), quiet_minutes=round(quiet_minutes, 2),
-    quiet_touchdowns_per_min=round(float(totals["quiet_touchdowns"].sum()) / max(quiet_minutes, 1e-6), 2),
-    quiet_arm_speed_rps=mean([r["quiet_arm_speed_rps"] for r in rows]), quiet_leg_speed_rps=mean([r["quiet_leg_speed_rps"] for r in rows]),
-    arm_speed_rps=mean([r["arm_speed_rps"] for r in rows]), action_rate=mean([r["action_rate"] for r in rows]),
-    capture_point_outside_frac=mean([r["capture_point_outside_frac"] for r in rows]),
-    capture_point_outside_band_frac=mean([r["capture_point_outside_band_frac"] for r in rows]),
-    one_step_urgent_frac=mean([r["one_step_urgent_frac"] for r in rows]),
-    torque_ratio_max=max(r["torque_ratio_max"] for r in rows),
-    human_pose_gap_walking_rad=mean([r["human_pose_gap_walking_rad"] for r in rows]),
-    human_velocity_gap_walking_rps=mean([r["human_velocity_gap_walking_rps"] for r in rows]),
-    human_pose_gap_standing_rad=mean([r["human_pose_gap_standing_rad"] for r in rows]))
-  if stops:                                                   # every stop of every script (a fall ends its stop early)
-    last, travel = sorted(stop["last_landing_s"] for stop in stops), sorted(stop["last_travel_s"] for stop in stops)
+    height_error_m=None if manufacturer else mean([r["height_error_m"] for r in aggregate]),
+    quiet_touchdowns=int(quiet_landings), quiet_minutes=round(quiet_minutes, 2),
+    quiet_touchdowns_per_min=round(float(quiet_landings) / max(quiet_minutes, 1e-6), 2),
+    quiet_arm_speed_rps=mean([r["quiet_arm_speed_rps"] for r in aggregate]), quiet_leg_speed_rps=mean([r["quiet_leg_speed_rps"] for r in aggregate]),
+    arm_speed_rps=mean([r["arm_speed_rps"] for r in aggregate]), action_rate=mean([r["action_rate"] for r in aggregate]),
+    capture_point_outside_frac=mean([r["capture_point_outside_frac"] for r in aggregate]),
+    capture_point_outside_band_frac=mean([r["capture_point_outside_band_frac"] for r in aggregate]),
+    one_step_urgent_frac=mean([r["one_step_urgent_frac"] for r in aggregate]),
+    torque_ratio_max=max((r["torque_ratio_max"] for r in aggregate), default=None),
+    human_pose_gap_walking_rad=mean([r["human_pose_gap_walking_rad"] for r in aggregate]),
+    human_velocity_gap_walking_rps=mean([r["human_velocity_gap_walking_rps"] for r in aggregate]),
+    human_pose_gap_standing_rad=mean([r["human_pose_gap_standing_rad"] for r in aggregate]))
+  if summary_stops:                                         # a fall ends its stop early; do not claim a short failed stop is better
+    last, travel = sorted(stop["last_landing_s"] for stop in summary_stops), sorted(stop["last_travel_s"] for stop in summary_stops)
     p95 = lambda values: values[int(0.95 * (len(values) - 1))]  # noqa: E731
     summary.update(
-      stops=len(stops), stop_landings_per_stop=round(float(np.mean([stop["landings"] for stop in stops])), 3),
-      stop_landings_by_time={label: int(sum(stop["by_time"][k] for stop in stops)) for k, label in enumerate(STOP_LABELS)},
-      stops_with_landing_after_1p5s=sum(1 for stop in stops if sum(stop["by_time"][3:]) > 0),
-      stops_with_landing_after_3s=sum(1 for stop in stops if stop["by_time"][5] > 0),
+      stops=len(summary_stops), stop_landings_per_stop=round(float(np.mean([stop["landings"] for stop in summary_stops])), 3),
+      stop_landings_by_time={label: int(sum(stop["by_time"][k] for stop in summary_stops)) for k, label in enumerate(STOP_LABELS)},
+      stops_with_landing_after_1p5s=sum(1 for stop in summary_stops if sum(stop["by_time"][3:]) > 0),
+      stops_with_landing_after_3s=sum(1 for stop in summary_stops if sum(stop["by_time"][5:]) > 0),
       stop_last_landing_s=dict(mean=round(float(np.mean(last)), 2), p95=p95(last), max=last[-1]),
       stop_last_travel_s=dict(mean=round(float(np.mean(travel)), 2), p95=p95(travel), max=travel[-1]),
-      stop_overshoot_m=round(float(np.mean([stop["overshoot_m"] for stop in stops])), 3))
+      stop_overshoot_m=round(float(np.mean([stop["overshoot_m"] for stop in summary_stops])), 3))
   if anchor is not None:
     summary.update(anchor_gap_legs=mean([r["anchor_gap_legs"] for r in rows]), anchor_gap_waist=mean([r["anchor_gap_waist"] for r in rows]),
                    anchor_gap_arms=mean([r["anchor_gap_arms"] for r in rows]))
@@ -907,6 +1144,34 @@ def main():
                 checkpoint=str(checkpoint), variant=args.variant, step_dt=dt, seconds=args.seconds, repeats=args.repeats,
                 note="manufacturer: no height input; height scripts are run but not scored" if manufacturer else None,
                 elapsed_s=round(time.time() - started, 1), summary=summary, by_script=by_script, episodes=rows, stops=stops)
+  if command_pack is not None:
+    for row, spec in zip(rows, command_pack.rows, strict=True):
+      row.update(block_id=spec["block_id"], frozen_case=spec)
+  if comparison:
+    commands_path = out_dir / f"{tag}.commands.npz"
+    with commands_path.open("xb") as commands_file:
+      np.savez_compressed(commands_file, **{key: np.asarray(value) for key, value in command_trace.items()},
+                          dt=np.float64(dt), sampling="pre-action; command k applies on [k*dt,(k+1)*dt)",
+                          raw_target_columns=np.array(["vx", "vy", "yaw_rate", "height", "height_on", "pitch", "pitch_on"]))
+    comparison_metadata["commands"] = dict(path=str(commands_path), sha256=hashlib.sha256(commands_path.read_bytes()).hexdigest())
+    summary.update(scope="intersection with manufacturer WALK support; full raw rows retained",
+                   completed=sum(r["completed"] for r in aggregate),
+                   motion_comparison_valid_without_survival_conditioning=all(r["completed"] for r in aggregate))
+    result.update(comparison_contract=comparison_metadata,
+                  all_scripts_summary=dict(episodes=len(rows), falls=sum(r["fell"] for r in rows)),
+                  note="Unsupported turn/run/height/pitch scripts are retained but excluded from all comparative summary fields. "
+                       "Motion averages with incomplete episodes are descriptive only; they do not establish lower necessary motion.")
+    print("native-r1 excluded from comparative summaries:",
+          {name: record["reasons"] for name, record in support.items() if not record["supported"]})
+  if sensor_hook is not None:
+    from r1wb.eval.reaction_metrics import summarize_actor_trace
+    actor_trace = sensor_hook.close(horizon)
+    result["proper_evaluation"] = dict(noise_profile=args.observation_profile, actor_trace=actor_trace,
+                                       fixed_horizon_steps=horizon, observation_contract=sensor_hook.stream.metadata,
+                                       motion_summary=summarize_actor_trace(actor_trace["path"]),
+                                       interventions="none; no post-hit clock, arm scaling or learned steering")
+    if archive is not None:
+      archive.manifest["proper_evaluation"] = result["proper_evaluation"]
   if archive is not None:
     result["video"] = archive.close()
   (out_dir / f"{tag}.json").write_text(json.dumps(result, indent=1, default=str))

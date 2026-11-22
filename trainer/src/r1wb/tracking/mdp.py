@@ -11,6 +11,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
+from r1wb.performance import cached_read, device_indices
 
 from mjlab.utils.lab_api.math import (matrix_from_quat, quat_apply, quat_apply_inverse, quat_error_magnitude, quat_inv,
                                       quat_mul, yaw_quat)
@@ -23,20 +24,42 @@ def _term(env, command_name):
   return env.command_manager.get_term(command_name)
 
 
+@cached_read
 def heading_shift(term) -> torch.Tensor:
   """Planar rotation that gives the reference the robot's heading (the re-anchoring the relative body terms use)."""
   return yaw_quat(quat_mul(term.robot_anchor_quat_w, quat_inv(term.anchor_quat_w)))
 
 
+@cached_read
 def local_anchor_quat(term) -> torch.Tensor:
   """Reference anchor rotation after re-anchoring: the reference's tilt at the robot's heading."""
   return quat_mul(heading_shift(term), term.anchor_quat_w)
 
 
 def _body_ids(term, body_names):
-  if body_names is None:
-    return list(range(len(term.cfg.body_names)))
-  return [i for i, name in enumerate(term.cfg.body_names) if name in body_names]
+  ids = [i for i, name in enumerate(term.cfg.body_names) if body_names is None or name in body_names]
+  return device_indices(term._env, ids)
+
+
+def body_position_error_exp(env, command_name, std, body_names=None):
+  term = _term(env, command_name)
+  ids = _body_ids(term, body_names)
+  error = torch.sum(torch.square(term.body_pos_relative_w[:, ids] - term.robot_body_pos_w[:, ids]), dim=-1)
+  return torch.exp(-error.mean(-1) / std**2)
+
+
+def body_orientation_error_exp(env, command_name, std, body_names=None):
+  term = _term(env, command_name)
+  ids = _body_ids(term, body_names)
+  error = quat_error_magnitude(term.body_quat_relative_w[:, ids], term.robot_body_quat_w[:, ids]) ** 2
+  return torch.exp(-error.mean(-1) / std**2)
+
+
+def body_z_error(env, command_name, threshold, body_names=None):
+  term = _term(env, command_name)
+  ids = _body_ids(term, body_names)
+  error = torch.abs(term.body_pos_relative_w[:, ids, -1] - term.robot_body_pos_w[:, ids, -1])
+  return torch.any(error > threshold, dim=-1)
 
 
 # -- observations: the reference as seen from where the robot is (no planar or heading error) -------------------
@@ -107,7 +130,7 @@ def stance_slip(env: ManagerBasedRlEnv, sensor_name: str, foot_bodies: tuple[str
   cache = robot.__dict__.setdefault("_r1wb_cache", {})
   if "feet" not in cache:
     cache["feet"] = [robot.body_names.index(name) for name in foot_bodies]
-  speed = torch.norm(robot.data.body_link_lin_vel_w[:, cache["feet"], :2], dim=-1)
+  speed = torch.norm(robot.data.body_link_lin_vel_w[:, device_indices(env, cache["feet"]), :2], dim=-1)
   contact = env.scene[sensor_name].data.found.reshape(env.num_envs, -1)[:, :len(foot_bodies)] > 0
   if command_name is not None:
     term = _term(env, command_name)
@@ -168,7 +191,8 @@ class step_unprompted:
   def __call__(self, env: ManagerBasedRlEnv, command_name: str, sensor_name: str, foot_bodies: tuple[str, ...],
                height_band: float = 0.02, speed_limit: float = 0.15, min_air: int = 3, rest: bool = False,
                calm: float = 0.0) -> torch.Tensor:
-    """calm (with rest): a flight is only charged if no hit landed within this many seconds before or during it.
+    """Legacy evaluation only: positive calm exempts flights following a recent hit.
+    At calm=0 every flight is priced without consulting the hit clock.
     In the scene 86% of the steps taken under a standing course follow a hit within 2 s (reward check 11-13
     14:15: 127 per 100 env-s there against 7 when calm): without this the term is mostly a tax on recovering."""
     term = _term(env, command_name)
@@ -177,9 +201,10 @@ class step_unprompted:
     if rest:
       hold = getattr(term, "hold", None)
       hold = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device) if hold is None else hold
-      clock = getattr(env, "hit_clock", None)
-      if calm > 0.0 and clock is not None:
-        hold = hold & (clock >= calm)
+      if calm > 0.0:
+        clock = getattr(env, "hit_clock", None)
+        if clock is not None:
+          hold = hold & (clock >= calm)
       planted = hold.unsqueeze(1).expand_as(contact)
     else:
       height = term.body_pos_w[:, ids, 2]
@@ -203,7 +228,7 @@ FOOTPRINT = ((-0.050, 0.133), (-0.035, 0.035))      # the sole's collision capsu
 
 
 class rest_room:
-  """While the course stands still and no hit landed in the last `grace` seconds: how much the capture point
+  """While the course stands still: how much the capture point
   (centre of mass + velocity / sqrt(g / height), r1wb.dynamics) lacks of `room` metres inside the support of both
   soles, in metres, at most `cap`.
 
@@ -212,20 +237,24 @@ class rest_room:
   nothing about the course's own pose tells the two apart. The posture price holds the body on the course's joint
   angles and says nothing about where the body is over its feet; this term prices exactly that, and only while the
   course itself claims to be at rest (no assumed gait, no step time). The steps are the symptom (`step_unprompted`
-  with `rest`), this is the condition they come from. Privileged (simulator state): a reward, nothing deployed."""
+  with `rest`), this is the condition they come from. Privileged (simulator state): a reward, nothing deployed.
+  Positive grace preserves historical evaluation only; grace=0 never consults the hit clock."""
 
   def __init__(self, cfg, env: ManagerBasedRlEnv):
     from r1wb import dynamics
     self.centroidal = dynamics.Centroidal(env, footprint=FOOTPRINT)
 
   def __call__(self, env: ManagerBasedRlEnv, command_name: str, room: float = 0.04, cap: float = 0.10,
-               grace: float = 2.0) -> torch.Tensor:
+               grace: float = 0.0) -> torch.Tensor:
     term = _term(env, command_name)
     hold = getattr(term, "hold", None)
     if hold is None:
       return torch.zeros(env.num_envs, device=env.device)
-    clock = getattr(env, "hit_clock", None)
-    calm = hold if clock is None else hold & (clock >= grace)
+    calm = hold
+    if grace > 0.0:
+      clock = getattr(env, "hit_clock", None)
+      if clock is not None:
+        calm = hold & (clock >= grace)
     lacking = (self.centroidal.support_margin()["d"] + room).clamp(0.0, cap)
     return lacking * calm.float()
 
@@ -259,11 +288,11 @@ def local_body_angular_velocity_error_exp(env: ManagerBasedRlEnv, command_name: 
   return torch.exp(-error.mean(-1) / std**2)
 
 
-def course_is_trusted(env: ManagerBasedRlEnv, command_name: str, stream: str = "always", grace: float = 2.0) -> torch.Tensor:
+def course_is_trusted(env: ManagerBasedRlEnv, command_name: str, stream: str = "always", grace: float = 0.0) -> torch.Tensor:
   """1 where the reference is a valid course, per environment. A clip is one at all times. A matched command stream
   re-selects its reference from the pushed robot's feet (measured 11-12 03:00: the walking reaction then never
   returns to its orbit), so `stream` says how far it is trusted: "always", "calm" (not within `grace` seconds of a
-  hit) or "never"."""
+  hit) or "never". Positive grace is retained for historical evaluation; grace=0 does not read hit timing."""
   term = _term(env, command_name)
   ones = torch.ones(env.num_envs, device=env.device)
   streams = getattr(term, "stream_env", None)
@@ -271,13 +300,26 @@ def course_is_trusted(env: ManagerBasedRlEnv, command_name: str, stream: str = "
     return ones
   if stream == "never":
     return (~streams).float()
+  if grace <= 0.0:
+    return ones
   clock = getattr(env, "hit_clock", None)
   calm = ones.bool() if clock is None else clock >= grace
   return (~streams | calm).float()
 
 
+def joint_motion_l1(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Mean measured joint speed (rad/s); the reward manager integrates it into joint path length.
+
+  A pose error or an action-rate cost can stay small while the physical joints oscillate. This term prices actual
+  motion at every step, including recovery: task and failure rewards determine which motion is worth taking.
+  L1 preserves the cost of a fixed path when its duration changes; no reference-phase subtraction, hit exemption
+  or saturation lets a policy hide extra motion. It is a motion regularizer, not an energy or necessity oracle.
+  """
+  return env.scene["robot"].data.joint_vel.abs().mean(dim=1)
+
+
 def joint_course_l1(env: ManagerBasedRlEnv, command_name: str, cap: float | None = None, stream: str = "always",
-                    grace: float = 2.0) -> torch.Tensor:
+                    grace: float = 0.0) -> torch.Tensor:
   """Mean absolute distance of the joint angles to the course (the reference's joint angles), rad per joint, the
   same price for every joint. The pose kernels are wide (0.3 m, 0.4 rad): with them alone a tracker earns more by
   reacting to a hit with its arms than by keeping them on the course (measured, gates 11-12 01:20). This term prices
@@ -290,7 +332,7 @@ def joint_course_l1(env: ManagerBasedRlEnv, command_name: str, cap: float | None
 
 
 def posture_course_l1(env: ManagerBasedRlEnv, command_name: str, cap: float | None = None, stream: str = "always",
-                      grace: float = 2.0) -> torch.Tensor:
+                      grace: float = 0.0) -> torch.Tensor:
   """Mean angle (rad per tracked link) between how the robot's links stand in space and how the course's do: the
   posture price measured against gravity and the ground instead of joint by joint.
 
@@ -298,8 +340,9 @@ def posture_course_l1(env: ManagerBasedRlEnv, command_name: str, cap: float | No
   hangs in space (against gravity); a foot's course orientation is first laid on the ground under that foot (the ray
   sensor's surface normal), so a sole flat on a slope is on its course. On a flat floor the feet are compared like
   the rest. Why: the joint-angle price (joint_course_l1) charges what a slope itself demands (20 deg of ankle on a
-  20 deg slope, for as long as the robot is on it: up to 162 per episode at the cap against 60 for a fall), so
-  adapting to the ground costs more than failing on it (gates 11-14 03:2x). Measured against gravity and the
+  20 deg slope, for as long as the robot is on it: up to 162 undiscounted per episode at the cap against 60 for a
+  fall; at gamma=.99 the 500-step cap cost is 32.187, so this comparison alone does not prove a failure incentive).
+  The terrain adaptation is still priced by joint error (gates 11-14 03:2x). Measured against gravity and the
   surface, an upright body with its soles on the slope pays nothing."""
   from mjlab.utils.lab_api.math import quat_error_magnitude, quat_mul
   term = _term(env, command_name)
@@ -323,7 +366,7 @@ def posture_course_l1(env: ManagerBasedRlEnv, command_name: str, cap: float | No
 
 
 def course_travel_l1(env: ManagerBasedRlEnv, command_name: str, yaw_scale: float = 0.3, stream: str = "always",
-                     grace: float = 2.0) -> torch.Tensor:
+                     grace: float = 0.0) -> torch.Tensor:
   """How far the robot's own travel is from the course's: the root twists (running means over the last 0.4 s of
   what each did, each in its own heading frame) apart in m/s, plus `yaw_scale` m per rad of yaw rate. The joint-course price charges the posture only, and
   under a high price a policy mimed a sideways course's joints while covering 0.67 to 0.75 of its distance with the
@@ -336,10 +379,14 @@ def course_travel_l1(env: ManagerBasedRlEnv, command_name: str, yaw_scale: float
 
 
 def tracking_is_judged(env: ManagerBasedRlEnv, grace: float) -> torch.Tensor:
-  """False for `grace` seconds after an external hit: a recovery step lifts a foot or lowers the pelvis by more than
+  """At grace=0 tracking is judged at every instant, without reading the hit clock.
+
+  Positive grace is historical evaluation only: a recovery step lifts a foot or lowers the pelvis by more than
   the tracking tolerances without any fall, and with bursts in the disturbances those endings (not falls) were what
   ended nearly every episode (run of 11-12 03:42: foot-height endings 27 -> 141 per window, tracking 128 -> 33 of 134).
   A real fall ends the episode at any time (`fallen`)."""
+  if grace <= 0.0:
+    return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
   clock = getattr(env, "hit_clock", None)
   if clock is None:
     return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
@@ -361,7 +408,8 @@ def judged_anchor_rot(env, command_name: str, threshold: float, grace: float) ->
 
 def judged_body_z(env, command_name: str, threshold: float, body_names: tuple[str, ...], grace: float) -> torch.Tensor:
   from mjlab.tasks.tracking import mdp as stock
-  return (stock.bad_motion_body_pos_z_only(env, command_name=command_name, threshold=threshold, body_names=body_names)
+  function = body_z_error if "_r1wb_read_cache" in env.__dict__ else stock.bad_motion_body_pos_z_only
+  return (function(env, command_name=command_name, threshold=threshold, body_names=body_names)
           & tracking_is_judged(env, grace))
 
 
@@ -406,6 +454,20 @@ class push_unless_calm:
     robot.write_root_link_velocity_to_sim(velocity, env_ids=env_ids)
 
 
+def uniform_equilibrium_residual(uniform: torch.Tensor, interval_s: tuple[float, float]) -> torch.Tensor:
+  """Inverse CDF of the stationary residual of T~U(a,b), for supplied draws uniform in [0,1].
+
+  Density is P(T>r)/E[T], not U(0,b). This pure transform consumes no RNG. It describes an independent observation
+  time in an ordinary renewal process; it does not reproduce burst- or failure-conditioned residuals.
+  """
+  low, high = interval_s
+  if not (math.isfinite(low) and math.isfinite(high) and 0.0 <= low <= high and high > 0.0):
+    raise ValueError("equilibrium reset requires a finite interval 0 <= low <= high with high > 0")
+  mean = 0.5 * (low + high)
+  tail = high - torch.sqrt((1.0 - uniform) * (high - low) * (high + low))
+  return torch.where(uniform <= low / mean, mean * uniform, tail)
+
+
 class impulse_unless_calm:
   """Force impulses at a point of one body from a horizontal direction drawn uniformly: the disturbance of the
   evaluation (momentum in N s) instead of a root-velocity kick. The impulse is spread over a duration drawn
@@ -416,10 +478,20 @@ class impulse_unless_calm:
   course; the reaction is then learned on the clips alone).
   height / side: where the impulse acts relative to the body's centre of mass, m. A number = always there; a
   (low, high) pair = drawn per hit (up and down the body: thigh to head; sideways of the line of the force: a hit on
-  a shoulder turns the robot). A ball does not choose the trunk's centre."""
+  a shoulder turns the robot). A ball does not choose the trunk's centre.
+  reset_on_episode: opt in to independent episode schedules and clear unfinished hits on reset. Defaults to False
+  to retain the disturbance distribution and RNG sequence of existing tasks; set it in the event's cfg.params.
+  reset_wait_mode: "fresh" retains v5's full-interval reset wait; "equilibrium" draws its ordinary-renewal residual.
+  Only reset_on_episode=True uses this mode. Construction and subsequent inter-hit/burst schedules are unchanged."""
 
   def __init__(self, cfg, env: ManagerBasedRlEnv):
     params = cfg.params
+    self._env = env
+    self._reset_on_episode = params.get("reset_on_episode", False)
+    self._interval_s = params["interval_s"]
+    self._reset_wait_mode = params.get("reset_wait_mode", "fresh")
+    if self._reset_on_episode and self._reset_wait_mode not in ("fresh", "equilibrium"):
+      raise ValueError("reset_wait_mode must be fresh or equilibrium")
     self.robot = env.scene["robot"]
     self.body = [self.robot.body_names.index(params.get("body", "torso_link"))]
     count, device = env.num_envs, env.device
@@ -435,16 +507,42 @@ class impulse_unless_calm:
     self.streams_marked = False
     env.hit_clock = torch.full((count,), 1.0e3, device=device)              # seconds since the last hit (privileged)
 
+  def reset(self, env_ids: torch.Tensor | None = None) -> None:
+    """Called by EventManager after episode reset, including for mode="step" terms."""
+    if not self._reset_on_episode:
+      return
+    if env_ids is None:
+      env_ids = torch.arange(len(self.wait), device=self.wait.device)
+    if len(env_ids) == 0:
+      return
+    low, high = self._interval_s
+    uniform = torch.rand(len(env_ids), device=self.wait.device)
+    self.wait[env_ids] = (uniform_equilibrium_residual(uniform, self._interval_s)
+                        if self._reset_wait_mode == "equilibrium" else low + (high - low) * uniform)
+    self.left[env_ids] = 0
+    self.force[env_ids] = 0.0
+    self.torque[env_ids] = 0.0
+    self.burst_left[env_ids] = 0
+    self.burst_angle[env_ids] = 0.0
+    self._env.hit_clock[env_ids] = 1.0e3
+    zeros = self.force[env_ids].unsqueeze(1)
+    self.robot.write_external_wrench_to_sim(zeros, zeros, env_ids=env_ids, body_ids=self.body)
+    # A non-reset env can still have a final one-step wrench in the simulator although its left is already zero.
+    # Keep the shared flag on partial reset so the next call clears that wrench. Manager env_ids are unique.
+    if len(env_ids) == len(self.wait):
+      self.written = False
+
   def __call__(self, env: ManagerBasedRlEnv, env_ids: torch.Tensor | None, command_name: str,
                impulse_range: tuple[float, float], interval_s: tuple[float, float], body: str = "torso_link",
                height: float | tuple[float, float] = 0.1, calm_fraction: float = 0.2, low_height: float = 0.5,
                low_scale: float = 0.4, side: float | tuple[float, float] = 0.0,
                duration_s: tuple[float, float] = (0.02, 0.02), ramp_steps: int = 0, burst_prob: float = 0.0,
                burst_hits: tuple[int, int] = (4, 12), burst_gap_s: tuple[float, float] = (0.08, 0.25),
-               burst_impulse: tuple[float, float] = (8.0, 16.0), calm_streams: bool = False) -> None:
+               burst_impulse: tuple[float, float] = (8.0, 16.0), calm_streams: bool = False,
+               reset_on_episode: bool = False, reset_wait_mode: str = "fresh") -> None:
     """burst_prob: share of the events that open a burst: `burst_hits` one-step hits of `burst_impulse` N s from
     about the same side, `burst_gap_s` apart (balls in a row)."""
-    del env_ids, body, calm_fraction
+    del env_ids, body, calm_fraction, reset_on_episode, reset_wait_mode
     device, dt = env.device, env.step_dt
     if calm_streams and not self.streams_marked:      # the command term exists only after the managers are built
       streams = getattr(_term(env, command_name), "stream_env", None)

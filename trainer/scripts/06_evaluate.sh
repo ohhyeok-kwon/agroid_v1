@@ -32,35 +32,42 @@
 #           LANGUAGES="ko en" PHRASES="train heldout"
 # On the workstation this forwards to the server (scripts/04_remote.sh) and then pulls. Nothing runs on the
 # workstation's GPU. State archives of the rollouts are captured on the server, packed, pulled in the background and
-# rendered on the workstation only (by the Operation Center); the server copy is removed once it has arrived.
+# rendered on the workstation only (by the Operation Center). Originals remain until explicitly removed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 host="${RL_REMOTE:-super-via-ailab}"; rdir="${RL_REMOTE_DIR:-/rl-agent}"
 
 pull() {    # $1 = run folder name: the results (small) now
-  local run=$1 work=../.agent/trainer kind here
-  here=$(cd "$work" && pwd)
+  local run=$1 work=../.agent/trainer kind incoming
+  mkdir -p "$work/result/transit"
+  incoming=$(mktemp -d "$work/result/transit/results.XXXXXXXX") || return 1
   for kind in render logs; do
     ssh "$host" "[ -d $rdir/.agent/result/$kind/$run ]" < /dev/null || continue
-    mkdir -p "$work/result/$kind/$run"
-    rsync -a "$host:$rdir/.agent/result/$kind/$run/" "$work/result/$kind/$run/" || { echo "pull failed: $kind"; return 1; }
+    mkdir -p "$incoming/$kind/$run"
+    rsync -a "$host:$rdir/.agent/result/$kind/$run/" "$incoming/$kind/$run/" || { echo "pull failed: $kind (partial files retained in $incoming)"; return 1; }
   done
-  find "$work/result/render/$run" -maxdepth 1 -name "*.json" 2>/dev/null \
-    | while read -r f; do grep -q "$rdir/" "$f" 2>/dev/null && sed -i "s#$rdir/.agent/#$here/#g; s#$rdir/src/#$(cd src && pwd)/#g" "$f"; done
+  PYTHONPATH="$PWD/src" "$work/.venv/bin/python" -B -m r1wb.eval.vector_evaluation_video \
+    --import-results "$incoming" --result-root "$work/result"
 }
 
 pull_archives() {    # the state archives of the rollouts (packed on the server, about 1 MB/s through the relay)
-  local work=../.agent/trainer here name run
-  here=$(cd "$work" && pwd); mkdir -p "$work/result/transit" "$work/result/video"
+  local work=../.agent/trainer name incoming remote_sha
+  mkdir -p "$work/result/transit" "$work/result/video"
   ssh "$host" "ls $rdir/.agent/result/transit/*.tar.zst 2>/dev/null" < /dev/null | while read -r remote; do
-    name=$(basename "$remote"); run=${name%%__*}
-    rsync -a --partial "$host:$remote" "$work/result/transit/$name" < /dev/null || { echo "archive pull failed: $name"; continue; }
-    zstd -d --long=27 -q -c "$work/result/transit/$name" | tar -x -C "$work/result/video" || { echo "unpack failed: $name"; continue; }
-    find "$work/result/video/$run" -maxdepth 2 -name "manifest.json" -newer "$work/result/transit/$name" 2>/dev/null \
-      | while read -r f; do sed -i "s#$rdir/.agent/#$here/#g; s#$rdir/src/#$(cd src && pwd)/#g" "$f"; done
-    ssh "$host" "rm -f -- $remote" < /dev/null
-    rm -f -- "$work/result/transit/$name"
-    echo "archived $(TZ=Asia/Seoul date '+%T') $name"
+    name=$(basename "$remote")
+    remote_sha=$(ssh "$host" "sha256sum -- $(printf '%q' "$remote")" < /dev/null) || { echo "archive hash failed: $name"; continue; }
+    remote_sha=${remote_sha%% *}
+    [[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid archive hash: $name"; continue; }
+    [ -f "$work/result/transit/received-$remote_sha.json" ] && continue
+    incoming=$(mktemp -d "$work/result/transit/received.XXXXXXXX") || return 1
+    rsync -a --partial "$host:$remote" "$incoming/$name" < /dev/null || { echo "archive pull failed; partial retained: $incoming"; continue; }
+    if PYTHONPATH="$PWD/src" "$work/.venv/bin/python" -B -m r1wb.eval.vector_evaluation_video \
+        --import-bundle "$incoming/$name" --sha256 "$remote_sha" --result-root "$work/result" > "$incoming/import.json"; then
+      cp -n "$incoming/import.json" "$work/result/transit/received-$remote_sha.json"
+      echo "verified $(TZ=Asia/Seoul date '+%T') $name (server and local originals retained)"
+    else
+      echo "archive verification/import failed; all files retained: $incoming"
+    fi
   done
 }
 
@@ -231,10 +238,22 @@ PYEOF
     *) echo "unknown: $what" ;;
   esac
 done
-# The state archives travel packed (the constant model fields repeat in every chunk: about ten times smaller).
+# Pack self-contained archives plus their original results/traces. Never delete server originals here.
+pack_failed=0
 if [ -d ".agent/result/video/$NAME" ]; then
   mkdir -p .agent/result/transit
-  tar -C .agent/result/video -cf - "$NAME" | zstd -T8 --long=27 -6 -q -o ".agent/result/transit/${NAME}__$(date +%Y%m%d-%H%M%S).tar.zst" \
-    && rm -rf -- ".agent/result/video/$NAME" .agent/result/video/_assets
+  if $PY -m r1wb.eval.vector_evaluation_video --localize-tree ".agent/result/video/$NAME"; then
+    packed=("video/$NAME")
+    for kind in render logs; do [ ! -d ".agent/result/$kind/$NAME" ] || packed+=("$kind/$NAME"); done
+    bundle=".agent/result/transit/${NAME}__$(date +%Y%m%d-%H%M%S-%N).tar.zst"
+    if tar -C .agent/result -cf - "${packed[@]}" | zstd -T8 --long=27 -6 -q -o "$bundle"; then
+      sha256sum "$bundle" > "$bundle.sha256"
+    else
+      echo "archive packing failed; source and partial bundle retained: $bundle"; pack_failed=1
+    fi
+  else
+    echo "archive asset verification failed; no source files removed"; pack_failed=1
+  fi
 fi
-echo "battery done $KEY $IT $(stamp)"
+echo "battery done $KEY $IT $(stamp) archive_pack_status=$pack_failed"
+exit "$pack_failed"

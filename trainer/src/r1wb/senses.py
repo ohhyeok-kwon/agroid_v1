@@ -30,6 +30,8 @@ BASE = 294                                    # the task teacher's observation t
 
 def kind_of(width: int) -> str:
   """Which senses an actor observation of `width` values carries ("" for the plain 273 / 294)."""
+  if width == 417:                         # Stage H: reference24/state26 + scan117
+    return "scan"
   if width in (273, BASE):
     return ""
   for kind, extra in WIDTH.items():
@@ -58,7 +60,8 @@ def add_sensor(cfg, kind: str) -> None:
 class Senses:
   def __init__(self, env):
     self.env = env
-    self.frames = torch.zeros(env.num_envs, HISTORY, FRAME, device=env.device)
+    frame_width = 3 * len(env.scene["robot"].joint_names) + 6
+    self.frames = torch.zeros(env.num_envs, HISTORY, frame_width, device=env.device)
     self.scan = torch.zeros(env.num_envs, SCAN, device=env.device)
     self.stamp = None
     self.has_scan = "ground_scan" in env.scene.sensors
@@ -98,6 +101,20 @@ class Senses:
     stamp = int(env.common_step_counter)
     started = env.episode_length_buf < 1
     first = self.stamp is None
+    if "_r1wb_read_cache" in env.__dict__:
+      # Keep reset masks on device, including a reset followed by a second read
+      # within this control step. No host decision or dynamic boolean gather.
+      frame = self._frame()
+      advanced = first or stamp != self.stamp
+      if advanced:
+        self.frames = torch.roll(self.frames, -1, dims=1)
+        self.frames[:, -1] = frame
+        self.stamp = stamp
+      fill = torch.ones_like(started) if first else started
+      torch.where(fill[:, None, None], frame[:, None, :], self.frames, out=self.frames)
+      scan = self._scan(started)
+      self.scan = scan if advanced else torch.where(started.any(), scan, self.scan)
+      return self.frames.flatten(1), self.scan
     if first or stamp != self.stamp or bool(started.any()):
       frame = self._frame()
       if first or stamp != self.stamp:

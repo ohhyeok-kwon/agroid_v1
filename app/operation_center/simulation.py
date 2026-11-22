@@ -14,7 +14,14 @@ EXPERIMENTS = [('dynamic_mode','DynamicMode'), ('reference_teacher','사람 모�
 DYNAMIC = 'dynamic_mode'
 DYNAMIC_SPEEDS = ('slow','normal','fast')
 DYNAMIC_POSTURES = ('stand','rise','slight','deep')
-DYNAMIC_KEYS = ('instruction','speed','posture')
+DYNAMIC_KEYS = ('instruction','speed','posture','model')
+# DynamicMode 연결 모델: E114(전신 스택, 기본) · B0(S1 목적 정책 하나) · SONIC-R1(현재 학습의 최신 고정본 / 이식 원판 B@0,
+# 참조는 calm v2 인과 합성기). 선택은 서버가 기억하고 바뀌면 작업 프로세스를 다시 띄운다. 이름은 선택 파일의 label 이며
+# 작업 프로세스를 띄울 때마다 다시 읽는다(pin_sonic.sh 로 다시 고정한 것이 다음 시작에 보인다).
+DYNAMIC_MODELS = (('e114','.agent/operation_center/dynamic_mode.json','E114 · 2248'),
+                  ('b0','.agent/operation_center/dynamic_mode_b0.json','B0 · 2400 (S1 목적, 실험)'),
+                  ('sonic','.agent/operation_center/dynamic_mode_sonic.json','SONIC-R1 · 현재 학습'),
+                  ('sonic_b0','.agent/operation_center/dynamic_mode_sonic_b0.json','SONIC-R1 · 이식 B@0 (비교)'))
 ENVIRONMENTS = [('flat','평지'),('rocks','큰 돌 지형'),('stairs','계단 · 6cm'),('mixed','돌 + 계단')]
 PROJECTILE_SETTINGS = {'min_speed':5, 'max_speed':25, 'default_speed':12, 'mass':1., 'radius':.07, 'lifetime':5., 'capacity':8}
 
@@ -43,6 +50,16 @@ class Simulation:
         self.mode = 'standard'; self.environment = 'flat'; self.camera = None; self.dynamic_fresh = False
         self.dynamic_process = None; self.dynamic_worker = None; self.dynamic_log = None; self.dynamic_environment = None
         self.dynamic_current = {'state':'stopped','action':DYNAMIC,'message':'DynamicMode 를 시작합니다.'}
+        self.dynamic_model = DYNAMIC_MODELS[0][0]; self.dynamic_running_model = None
+        self.dynamic_models = self._dynamic_labels()
+
+    def _dynamic_labels(self):
+        models = []
+        for key,manifest,label in DYNAMIC_MODELS:
+            try: label = json.loads((self.root/manifest).read_text()).get('label',label)
+            except (OSError,ValueError,AttributeError): pass
+            models.append({'id':key,'label':label})
+        return models
 
     def start(self):
         with self.lock:
@@ -110,7 +127,7 @@ class Simulation:
             if self.closed:
                 return
             running = self.dynamic_process and self.dynamic_process.poll() is None
-            if running and self.dynamic_environment == environment:
+            if running and self.dynamic_environment == environment and self.dynamic_running_model == self.dynamic_model:
                 return
         self.stop_dynamic()
         with self.lock:
@@ -123,8 +140,10 @@ class Simulation:
             self.dynamic_log = (directory/'dynamic_mode.log').open('a')
             self.dynamic_current = {'state':'loading','action':DYNAMIC,'environment':environment,
                                     'message':'DynamicMode 스택을 불러오는 중입니다(처음 10~20초).'}
-            self.dynamic_environment = environment
-            command = [str(python),'-u','-B',str(self.app/'dynamic_worker.py'),'--environment',environment]
+            self.latest_frame = None
+            self.dynamic_environment = environment; self.dynamic_running_model = self.dynamic_model
+            self.dynamic_models = self._dynamic_labels()
+            command = [str(python),'-u','-B',str(self.app/'dynamic_worker.py'),'--environment',environment,'--model',self.dynamic_model]
             env = {**os.environ,'PYTHONDONTWRITEBYTECODE':'1','OMP_NUM_THREADS':'2','MUJOCO_GL':'egl',
                    'PYTHONPATH':str(self.root/'trainer/src')}
             # As for the standard worker: fork from the reader thread, which lives as long as the process.
@@ -197,6 +216,7 @@ class Simulation:
             return {**current,'actions':[{'id':key,'label':label} for key,label in ACTIONS],
                     'experiments':[{'id':key,'label':label} for key,label in EXPERIMENTS],
                     'environments':[{'id':key,'label':label} for key,label in ENVIRONMENTS],
+                    'dynamic_models':self.dynamic_models,'dynamic_model':self.dynamic_model,
                     'launcher':{**PROJECTILE_SETTINGS,**current.get('launcher',{})}}
 
     def frame(self):
@@ -219,6 +239,8 @@ class Simulation:
             raise ValueError('알 수 없는 속도입니다.')
         if 'posture' in data and data['posture'] not in DYNAMIC_POSTURES:
             raise ValueError('알 수 없는 자세입니다.')
+        if 'model' in data and data['model'] not in [key for key,_,_ in DYNAMIC_MODELS]:
+            raise ValueError('알 수 없는 연결 모델입니다.')
         if 'action' in data and data['action'] not in dict(ACTIONS) and data['action'] not in dict(EXPERIMENTS):
             raise ValueError('알 수 없는 액션입니다.')
         if 'environment' in data and data['environment'] not in dict(ENVIRONMENTS):
@@ -240,10 +262,17 @@ class Simulation:
                 raise ValueError('카메라 위치가 올바르지 않습니다.')
         if 'environment' in data:
             self.environment = data['environment']
+        if 'model' in data:
+            self.dynamic_model = data['model']     # sticky; a change restarts the DynamicMode worker
         if 'camera' in data:
             self.camera = data['camera']          # (a DynamicMode worker started later begins with the view in use)
         if 'action' in data:
             entering = data['action'] == DYNAMIC and self.mode != 'dynamic'
+            if (data['action'] == DYNAMIC) != (self.mode == 'dynamic'):
+                with self.frame_condition:
+                    self.latest_frame = None
+                    self.frame_id += 1
+                    self.frame_condition.notify_all()
             self.mode = 'dynamic' if data['action'] == DYNAMIC else 'standard'
         else:
             entering = False
@@ -266,7 +295,9 @@ class Simulation:
             process = self.dynamic_process
             running = process is not None and process.poll() is None
             failed = self.dynamic_current.get('state') == 'error'
-            changed = self.dynamic_environment != self.environment
+            changed = self.dynamic_environment != self.environment or self.dynamic_running_model != self.dynamic_model
+        if not running and data.get('active') is False and not any(key in data for key in ('action', 'reset', 'environment')):
+            return
         if (not running or changed) and (entering or changed or data.get('reset') or 'action' in data or not failed):
             # (after an error it is started again only when the user asks: the action or the reset button)
             self.start_dynamic(self.environment)
@@ -275,7 +306,7 @@ class Simulation:
                 if self.process and self.process.poll() is None:
                     try: self._send(self.process, {'active':False,'axes':[0,0]})
                     except (BrokenPipeError,OSError): pass
-        data = {key:value for key,value in data.items() if key not in ('action','environment')}
+        data = {key:value for key,value in data.items() if key not in ('action','environment','model')}
         if self.dynamic_fresh:
             self.dynamic_fresh = False
             if self.camera is not None and 'camera' not in data:

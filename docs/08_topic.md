@@ -1,7 +1,7 @@
 # 토픽
 
-토픽·타입은 현재 소스 기준. R1 연결 중단으로 최신 실행 상태는 미확인이다.
-`ROS_DOMAIN_ID=0`, Fast DDS. 실행 노드 9개. controller는 humanoid_controller, humanoid_controller_msg는 메시지 패키지다.
+토픽·타입은 현재 소스 기준이며 R1 실행본(11-22 23:02 조회, 아래 23개·노드 11개)과 일치한다.
+`ROS_DOMAIN_ID=0`, Fast DDS. 실행 노드 11개. controller는 humanoid_controller, humanoid_controller_msg는 메시지 패키지다.
 
 | 토픽 | 타입 | 발행자 → 구독자 | 주기 |
 |---|---|---|---|
@@ -13,17 +13,17 @@
 | `/tf_static` | tf2_msgs/TFMessage | state_manager → Operation Center | 시작 시 |
 | `/robot_description` | std_msgs/String URDF | state_manager → 외부 | 시작 시 |
 | `/mcu_status` | std_msgs/String JSON | controller → remote_controller | RF 변경 시·약 200Hz |
-| `/joy` | sensor_msgs/Joy | remote_controller → state_manager·walking | 약 50Hz |
+| `/joy` | sensor_msgs/Joy | remote_controller → state_manager·walking·careful_walk·safe_crouch | 약 50Hz |
 | `/remote_status` | std_msgs/String JSON | remote_controller → boot_manager·state_manager | 10Hz |
 | `/humanoid_state/request` | std_msgs/String JSON | 외부 → state_manager | 요청 시 |
 | `/humanoid_state` | std_msgs/String JSON | state_manager → safty_manager·외부 | 10Hz·안전 전환 시 |
-| `/motion_manager/goal` | std_msgs/String JSON | state_manager → action 4개 | 10Hz |
+| `/motion_manager/goal` | std_msgs/String JSON | state_manager → action 6개 | 10Hz |
 | `/motion_manager/result` | std_msgs/String JSON | 선택된 action → state_manager | 50Hz |
 | `/lowcmd` | humanoid_controller_msg/LowCmd | state_manager → safty_manager | 50Hz |
 | `/safty_manager/lowcmd` | humanoid_controller_msg/LowCmd | safty_manager → controller | 수신 즉시 |
-| `/lowstate` | humanoid_controller_msg/LowState | controller → walking·safty_manager·외부 | 100Hz |
+| `/lowstate` | humanoid_controller_msg/LowState | controller → walking·careful_walk·safe_crouch·safty_manager·외부 | 100Hz |
 | `/safty_status` | std_msgs/String JSON | safty_manager → state_manager·외부 | 10Hz·상태 변경 시 |
-| `/walking_status` | std_msgs/String JSON | walking → state_manager | 10Hz |
+| `/walking_status`·`/careful_walk_status`·`/safe_crouch_status` | std_msgs/String JSON | 각 action → state_manager | 10Hz |
 | `/rosout` | rcl_interfaces/Log | 운영 노드 → 외부 | 이벤트 |
 | `/parameter_events` | rcl_interfaces/ParameterEvent | 앱·ROS 도구 → 외부 | 이벤트 |
 
@@ -41,10 +41,10 @@ LowState는 몸체 IMU(wxyz·rad/s·m/s²·rad·℃)와 발목 속도 환산을 
 `/motor_status`·`/mcu_status`의 received_mono_ms는 나이·순서, received_unix_ms는 표시용이다.
 `/safty_status`: 현재 전 레이어 OFF로 판정하지 않는다. 활성화 시 201 경고·202 fault와 원인을 발행하며 202는 기립을 요청한다.
 `/joy.axes`=[lx,ly,rx,ry], buttons=R1,L1,start,select,R2,L2,F1,F2,A,B,X,Y,up,right,down,left.
-요청값: zero_moment·damping·locked_standing·walking. 보행은 기립 완료·모델·IMU 준비가 필요하다.
+요청값: zero_moment·damping·locked_standing·walking. 학습 동작(careful_walk·safe_crouch)은 요청 토픽으로는 거절되고 리모컨으로만 선택된다. 두 보행은 기립 완료·모델·IMU 준비가 필요하다.
 L2를 먼저 누른 채 B→damping, damping에서 Y→zero_moment, zero/damping에서 ↑→locked_standing.
-기립에서 R2+A→보행, 스틱 중립 후 L2+↑→기립. 보행 중 L2+B→즉시 감쇠.
-`/walking_status`에는 준비·활성·선택 모델·목표 속도·계산 시간이 포함된다. 리모컨 미연결은 boot_manager에서 202다.
+기립에서 R2+A→제조사 보행, R2+X→학습 보행(careful_walk; 진입·리모컨 복귀 뒤에는 스틱을 0.2초 중립에 둔 다음에만 출발). 스틱 중립 후 L2+↑→기립. 보행 중 L2+B→즉시 감쇠.
+`/walking_status`에는 준비·활성·선택 모델·목표 속도·계산 시간이, `/careful_walk_status`에는 준비·활성·moving(참조가 서기로 돌아오기 전)이 포함된다. 리모컨 미연결은 boot_manager에서 202다.
 TF 루트는 pelvis_link. map·odom·월드 자세는 미발행이다. 정적 변환은 14개, 관절은 최대 26개다.
 USB 단절·3초 초과·유효 관절 0개면 TF를 갱신하지 않는다. 나머지는 유효 관절만 보낸다.
 재확인: `ros2 topic list -t`, `ros2 topic info -v /safty_manager/lowcmd`. [패키지](03_packages.md)·[DTC](05_dtc.md).

@@ -82,7 +82,7 @@ impl walking_action_manager::policy_runtime::Policy for SafeCrouch {
     fn start(&mut self, input: &Input) -> Result<(), String> {
         SafeCrouch::start(self, input)
     }
-    fn sample(&mut self, input: &Input, _: [f32; 4], elapsed: f64) -> Result<Output, String> {
+    fn sample(&mut self, input: &Input, _: Option<[f32; 4]>, elapsed: f64) -> Result<Output, String> {
         SafeCrouch::sample(self, input, elapsed)
     }
 }

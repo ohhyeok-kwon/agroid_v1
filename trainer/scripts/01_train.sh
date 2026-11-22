@@ -35,5 +35,6 @@ fi
 launch_id="$(date +%Y%m%d-%H%M%S)-${BASHPID}-${RANDOM}${RANDOM}"
 scripts/04_remote.sh --gpus "$gpus" -d "$task" env \
   RL_STAMP="$(date +%Y%m%d-%H%M)" RL_LAUNCH_ID="$launch_id" \
+  .agent/.venv/bin/python -m r1lab.launch_watchdog --world-size "$gpus" --task "$task" -- \
   "${command[@]}" --task "$task" "${args[@]}"
 echo "학습 ID·상태·로그는 자동 등록되어 Operation Center의 Trainer에 표시됩니다. 상태: scripts/03_status.sh"

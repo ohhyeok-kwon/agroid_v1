@@ -127,13 +127,13 @@
 
 ## 공통 계약
 
-- R1 배포 정책은 ONNX `obs[1,810]` → `actions[1,24]`, 정규화기 내장, opset 11이다. Simulation은 지형 스캔을 붙인 927차원 후보도 지원하며 R1 배포와 분리한다([학습 계약](../trainer/docs/01_training.md)).
+- R1 배포 정책은 ONNX `obs[1,810]` → `actions[1,24]`, 정규화기 내장, opset 11이다(walking·safe_crouch). 학습 보행(careful_walk, 812)만 추종기 계약 `obs[1,1320]`(참조 540 + 몸 상태 이력 780) → `actions[1,24]`, opset 17이다. Simulation은 지형 스캔을 붙인 927차원 후보도 지원하며 R1 배포와 분리한다([학습 계약](../trainer/docs/01_training.md)).
 - `careful_walk_teacher`는 무작위 가중치에서 시작하는 `233→24` 전신 추종 교사다. 참조·진행 상태·미래 목표를 사용하는 전용 평가 대상이며, Simulation 조작 정책이나 R1 배포 정책으로 바로 쓰지 않는다. 제조사 가중치는 평가용 비교에만 사용한다.
 - `_precise` 후속은 자체 무작위 초기화 교사의 최종 가중치·optimizer만 이어받는다. 전신 위치 보상 0.5와 좌우 발별 월드 궤적 보상 0.5를 사용하며, 사람 접촉력 정답을 만들지 않는다.
 - `_coordinated`는 그 계보를 검증한 교사에서 발 보상 0.5를 유지하고 전신 위치 0.25·팔꿈치/손목 위치 0.25로 배분한다. 각 골반 좌표계에서 같은 로봇 기준점을 비교하며, 측정되지 않은 손목 회전은 강제하지 않는다. 참조·물리·관측·PPO는 유지한다.
 - 모든 교사 후속은 등록된 최종 체크포인트부터 무작위 초기화 원본까지 파일 해시·참조·초기화 계보를 검증한다. 기립 비교는 참조의 시작 XY·yaw를 한 번만 정렬해 임의의 원점 차이를 제거한다.
 - 관절 목표는 `q = default_joint_pos + action × action_scale`이다. PD 게인·기본자세는 각 정책 JSON의 제조사 값을 쓴다.
-- 학생 명령 계약 v2(`careful-walk-command-student-v2-lateral`): 810 입력 그대로, 한계 전진 .3·후진 .25·옆 .28 m/s·회전 1.0 rad/s, tick당 변화 (.025, .025, .08), 회전 명령이 0이면 IMU yaw 방향 유지(0.5초 추종 후 고정, `wz = clip(3·오차, ±1)`, 사각지대 .025 rad). 학습·학생 장면 평가·Simulation·고난도·투사체 평가와 R1 `careful_walk.json`의 `command` 블록이 같은 처리를 쓴다.
+- 학생 명령 계약 v2(`careful-walk-command-student-v2-lateral`): 810 입력 그대로, 한계 전진 .3·후진 .25·옆 .28 m/s·회전 1.0 rad/s, tick당 변화 (.025, .025, .08), 회전 명령이 0이면 IMU yaw 방향 유지(0.5초 추종 후 고정, `wz = clip(3·오차, ±1)`, 사각지대 .025 rad). 학습·학생 장면 평가·Simulation·고난도·투사체 평가가 같은 처리를 쓴다. R1의 812는 11-22부터 이 계약이 아니라 위 추종기 계약과 묶음 명령을 쓴다(`careful_walk.json`에 `command` 블록 없음).
 - 배포 학생은 검증된 교사를 DAgger로 증류(`careful_walk_student_matching_*`)하고, 필요하면 교사 과제 보상의 PPO에 교사 행동 MSE를 더해 미세조정한다(`careful_walk_student_rl_lateral`: 시작점은 완료된 증류 학생, 교사는 그 학생을 만든 교사와 같은 해시).
 
 ## 현재 정책과 로봇 적용
@@ -141,9 +141,11 @@
 - [careful_walk](../trainer/actions/careful_walk/): `(vx, vy, wz)`로 8방향·회전·정지. [Simulation](02_operation_center.md)은 비교 평가한 후보를 별도 선택 파일로 고정하며, 제조사 Walking 버튼도 유지한다.
 - 현재 Simulation careful_walk 후보는 증류 학생 D5·799(810 입력, 학생 계약 v2)다. 11-10 같은 입력 쌍 비교에서 직진 운동 에너지·착지·후진 수행은 제조사보다 낫지만, 외란 반응(움직이는 관절 수·팔 움직임·관절 정지 시간)과 옆걸음·회전·출발정지의 흔들림은 제조사보다 나쁘고 0.1~0.2초 간격 8발 이상 연타에 넘어진다. 사용자 판정은 "제조사보다 안정성이 떨어진다"이며 채택 정책이 아니다. 측정은 `.agent/analysis/strategy_review_20261110/`, 후속 설계는 `.agent/analysis/unified_policy_20261111/design.md`. 후속 계열(r1wb, 1198 입력)의 후보는 Simulation의 ‘통합 정책 S1(실험)’으로 확인하며 R1 배포 계약과는 별개다.
 - [safe_crouch](../trainer/actions/safe_crouch/): 높이 명령·권장값은 [설정](../trainer/actions/safe_crouch/safe_crouch.json)을 따른다. 목표 높이를 유지하며 damping·기립 복귀는 운영자가 결정한다. 모터·센서·통신이 동작해야 한다.
-- 새 정책은 투사체·복합 지형·외란 비교를 통과한 뒤 채택한다. 두 정책 모두 실기 검증 전이다.
-- 실험 중(11-14, R1 미연결; Simulation에서는 [DynamicMode](02_operation_center.md)로 실행): 지시문 + 머리 카메라 → VLM(교사 Qwen3-VL-8B, 학생 2B) → 목표 → 운동 토큰 머리 → RL 추종 정책의 2계층 구조(`trainer/src/r1wb/s2/`). 학습·평가 명령과 현재 수치는 [인수인계](../.agent/trainer/handover.md) 최신 요약, 판정 규칙은 [채점표](../.agent/analysis/vla_fullbody_20261112/scorecard.md)를 따른다.
+- 새 정책은 투사체·복합 지형·외란 비교를 통과한 뒤 채택한다. safe_crouch는 실기 검증 전이고, 아래 R1 학습 보행은 11-22에 사용자가 실기에서 잘 되는 것을 확인했다(흔들림·지연의 실기 수치 기록은 없음).
+- R1 학습 보행(812; 11-22 R1에 설치·재기동, 사용자가 리모컨으로 실기 보행 확인): 손으로 설계한 합성 참조 → SONIC 이식 추종기 R14@100(LoRA 미세조정)의 구조다. R1은 참조 생성기의 출력을 구운 묶음(평지 명령 13개)을 재생하고, Simulation은 [DynamicMode](02_operation_center.md)로 실행한다. R1 보드 점검(`--self-test`): 한 틱 p50 4.4·최대 6.9 ms(CPU 6 고정), 학습 쪽 행동과의 차 1.25e-6. 실기 지연(대기 상태 20초 읽기 측정): 센서 측정→모터 제어기 입력 약 9–20 ms·최악 약 24 ms(추론 4.1 ms 더한 추정, 학습은 15 ms 고정)이고 그 뒤 구간과 센서 자체 지연은 미측정이다.
+  역할과 흐름은 [학습 구조](13_train_archtecture.md), 모션별 설계는 [motions/](motions/)를 따른다. 참조는 사람 동작의 모방이 아니라 로봇 기준으로 설계한다.
+  11-14 의 VLM 2계층 구조(`trainer/src/r1wb/s2/`)는 DynamicMode 에서 비교용으로만 고를 수 있다.
 
-1. 채택할 ONNX·JSON을 PC의 해당 `src/motion_manager/<액션>_action_manager/config/`에 반영한다.
+1. 채택할 ONNX·JSON을 PC의 해당 `src/motion_manager/<액션>_action_manager/config/`에 반영한다(학습 보행은 추종기 ONNX·참조 묶음·설정·점검 행과 그 해시를 적은 `source.json`).
 2. 프로젝트 루트에서 `./scripts/03_deploy.sh`를 실행한다. 정책은 바이너리에 포함되며 PC에서 크로스 빌드한 런타임만 R1에 배포한다.
 3. `trainer/`는 GPU 서버에만 동기화한다. R1 배포 절차는 [초기 설정·배포](01_initial_setup.md)를 따른다.

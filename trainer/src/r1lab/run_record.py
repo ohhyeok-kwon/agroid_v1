@@ -1,7 +1,7 @@
 """Mandatory, atomic training registration and lifecycle records for Operation Center."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from copy import copy
 from datetime import datetime
 import json
@@ -20,6 +20,47 @@ from r1lab.distributed import distributed_context
 
 
 REGISTRATION_TIMEOUT = 120.0
+
+
+@contextmanager
+def run_info_lock(directory: Path):
+  """Serialize rank-zero updates with its official launch supervisor."""
+  import fcntl
+  with (Path(directory) / ".run_info.lock").open("a") as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    try:
+      yield
+    finally:
+      fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def refreshed_workers(directory: Path, info: dict) -> list[dict]:
+  workers = [dict(worker) for worker in info.get("workers", [])]
+  for worker in workers:
+    rank = worker["rank"]
+    if rank == 0:
+      status = {**info, "state": info.get("primary_state", info.get("state")),
+                "error": info.get("primary_error") if info.get("supervised_launch") else info.get("error")}
+    else:
+      try:
+        status = json.loads((Path(directory) / f"rank_{int(rank)}.json").read_text())
+      except (OSError, ValueError):
+        continue
+      if (not isinstance(status, dict) or status.get("id") != info["id"] or status.get("rank") != rank
+          or status.get("launch_id") != info.get("launch_id")):
+        continue
+    for key in ("pid", "host", "state", "iteration", "updated_at", "finished_at", "error",
+                "failure_diagnostics", "failure_iteration"):
+      if key in status:
+        worker[key] = status[key]
+  supervision = info.get("supervision", {})
+  if (supervision.get("phase") == "finished" and not supervision.get("remaining_owned_processes")
+      and supervision.get("state") in ("failed", "stopped")):
+    for worker in workers:
+      if worker.get("state") in ("starting", "running"):
+        worker.update(recorded_state=worker["state"], state=supervision["state"],
+                      state_source="launch_supervisor", finished_at=supervision.get("finished_at"))
+  return workers
 
 
 def atomic_json(path: Path, value) -> None:
@@ -124,18 +165,26 @@ class RunRecord(AbstractContextManager):
             "description": args.description,
             "state": "starting", "pid": os.getpid(), "host": socket.gethostname(),
             "created_at": time.time(), "log_file": "train.log", "iteration": None}
+    if os.environ.get("RL_SUPERVISED_LAUNCH") == "1":
+      info.update(supervised_launch=True, launch_id=slug(os.environ["RL_LAUNCH_ID"]),
+                  supervision={"pid": int(os.environ["RL_SUPERVISOR_PID"]),
+                               "token": os.environ["RL_SUPERVISOR_TOKEN"], "phase": "registering"})
     record = cls(directory, info)
     try:
       record.update()
     except BaseException:
-      directory.rmdir()  # Only the empty directory created by this attempt.
+      (directory / ".run_info.lock").unlink(missing_ok=True)
+      try:
+        directory.rmdir()  # Only the empty directory created by this attempt.
+      except OSError:
+        pass
       raise
     return record
 
   @classmethod
   def create_distributed(cls, args, task, work=None):
     """Register one run before GPU imports and attach torchrun workers to it."""
-    if int(os.environ.get("WORLD_SIZE", "1")) == 1:
+    if int(os.environ.get("WORLD_SIZE", "1")) == 1 and os.environ.get("RL_SUPERVISED_LAUNCH") != "1":
       return cls.create(args, task, work=work)
     context = distributed_context()
     root = runs_root(args, work)
@@ -222,25 +271,35 @@ class RunRecord(AbstractContextManager):
     return WorkerRecord(directory, info, context.rank, context.local_rank)
 
   def update(self, **changes):
-    info = {**self.info, **changes, "updated_at": time.time()}
-    if info.get("world_size", 1) > 1:
-      workers = [dict(worker) for worker in info["workers"]]
-      for worker in workers:
-        if worker["rank"] == 0:
-          status = info
-        else:
-          try:
-            status = json.loads((self.directory / worker["status_file"]).read_text())
-          except (FileNotFoundError, ValueError):
-            continue
-          if not isinstance(status, dict) or status.get("id") != info["id"] or status.get("rank") != worker["rank"]:
-            continue
-        for key in ("pid", "host", "state", "iteration", "updated_at", "finished_at", "error"):
-          if key in status:
-            worker[key] = status[key]
-      info["workers"] = workers
-    atomic_json(self.directory / "run_info.json", info)
-    self.info = info
+    with run_info_lock(self.directory):
+      try:
+        current = json.loads((self.directory / "run_info.json").read_text())
+      except FileNotFoundError:
+        current = {}
+      if current and (current.get("id") != self.info["id"] or current.get("launch_id") != self.info.get("launch_id")):
+        raise RuntimeError("Run identity changed during a rank-zero update")
+      info = {**current, **self.info, **changes, "updated_at": time.time()}
+      if info.get("supervised_launch"):
+        info["primary_state"] = changes.get("state", info.get("primary_state", info["state"]))
+        if "error" in changes:
+          info["primary_error"] = changes["error"]
+        if info["primary_state"] == "completed":
+          # Only the supervisor can confirm all ranks AND launcher exit zero.
+          info.update(state="running", finalization_pending=True)
+          if "finished_at" in info:
+            info["primary_finished_at"] = info["finished_at"]
+          info.pop("finished_at", None)
+        supervision = current.get("supervision", info.get("supervision", {}))
+        info["supervision"] = supervision
+        if supervision.get("state") in ("failed", "stopped", "completed"):
+          info["state"] = supervision["state"]
+          for key in ("error", "finished_at", "launcher_exit_code", "supervisor_exit_code"):
+            if key in supervision:
+              info[key] = supervision[key]
+      if info.get("workers"):
+        info["workers"] = refreshed_workers(self.directory, info)
+      atomic_json(self.directory / "run_info.json", info)
+      self.info = info
 
   @property
   def log_path(self):

@@ -24,10 +24,13 @@ System 2 learns what to ask of it after a hit too. Reinforcement learning (PPO),
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+import hashlib
 import math
 import os
 from pathlib import Path
 import time
+import warnings
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -46,6 +49,33 @@ TWIST_SCALE = (0.35, 0.35, 1.0)
 SEE = {"none": 10, "progress": 13, "full": 22}
 ACTIONS = 4                             # move or stand, correction (3)
 DEFAULT_HEIGHT = 0.731
+
+
+def _no_hit_forgiveness(value: float) -> float:
+  value = float(value)
+  if not math.isfinite(value) or value != 0.0:
+    raise ValueError("forgive must be 0: post-hit error/reward exemptions are disabled")
+  return value
+
+
+def _forgive_argument(value: str) -> float:
+  try:
+    return _no_hit_forgiveness(float(value))
+  except (TypeError, ValueError) as error:
+    raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def forgiveness_lineage(metadata: dict) -> list[float]:
+  """Recorded past rules remain provenance, never active runtime parameters."""
+  values, seen = [], set()
+  while isinstance(metadata, dict) and id(metadata) not in seen:
+    seen.add(id(metadata))
+    value = metadata.get("forgive")
+    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0.0:
+      values.append(float(value))
+    parent = metadata.get("parent_checkpoint")
+    metadata = parent.get("training_meta") if isinstance(parent, dict) else None
+  return values
 
 
 def yaw_of(quat: torch.Tensor) -> torch.Tensor:
@@ -77,9 +107,8 @@ class Progress:
     self.env, self.term, self.robot, self.told, self.leak = env, term, env.scene["robot"], told, leak
     count, device = env.num_envs, env.device
     self.gap, self.turn_gap = torch.zeros(count, 2, device=device), torch.zeros(count, device=device)     # world frame
-    # What the body owes the instruction (the reward's measure, training only): the same sums, but nothing is added
-    # while the body is being hit or recovering (`after_step(calm)`): distance lost to a push is not an error of
-    # following, and a System 2 that is paid for winning it back walks into the recovery (gates 11-13 11:37).
+    # Reward and observation accumulate every control step. There is no hit-clock
+    # exemption; the optional leak is the same decay at every step.
     self.owed, self.turn_owed = torch.zeros(count, 2, device=device), torch.zeros(count, device=device)
     self.last_pos, self.last_yaw = torch.zeros(count, 2, device=device), torch.zeros(count, device=device)
     self.shadow = torch.zeros(count, 3, device=device)         # the instruction, slewed as the stream slews
@@ -94,7 +123,7 @@ class Progress:
     self.gap[ids], self.turn_gap[ids], self.age[ids] = 0.0, 0.0, 0.0
     self.owed[ids], self.turn_owed[ids] = 0.0, 0.0
 
-  def after_step(self, calm: torch.Tensor | None = None) -> None:
+  def after_step(self) -> None:
     """After every control step. An instruction begins when what is told changes, and when an episode restarts
     (the slewed instruction then starts from the restarted stream's own value)."""
     dt = float(self.env.step_dt)
@@ -113,9 +142,8 @@ class Progress:
     position, yaw = data.root_link_pos_w[:, :2], yaw_of(data.root_link_quat_w)
     # The instruction's heading is the body's plus what the body still has to turn.
     moved, turned = position - self.last_pos, wrap(yaw - self.last_yaw)
-    counts = torch.ones_like(self.age) if calm is None else calm.float()
-    self.owed += (turn(self.shadow[:, :2], self.last_yaw + self.turn_owed) * dt - moved) * counts.unsqueeze(1)
-    self.turn_owed += (self.shadow[:, 2] * dt - turned) * counts
+    self.owed += turn(self.shadow[:, :2], self.last_yaw + self.turn_owed) * dt - moved
+    self.turn_owed += self.shadow[:, 2] * dt - turned
     self.gap += turn(self.shadow[:, :2], self.last_yaw + self.turn_gap) * dt - moved
     self.turn_gap += self.shadow[:, 2] * dt - turned
     if self.leak > 0.0:
@@ -248,7 +276,7 @@ class SteerPolicy(nn.Module):
     seen += (plane if see != "none" else []) + (plane if (remember and see != "none") else [])
     seen += (twist + [1.0, -1.0, 1.0] + [-1.0, 1.0, -1.0]) if see == "full" else []   # own twist, gravity, turning rates
     full = twist + [1.0, 1.0, 1.0, 1.0] + twist + plane + (plane if remember else [])
-    full += twist + [1.0, -1.0, 1.0] + [-1.0, 1.0, -1.0] + plane + [1.0]              # ... owed progress, time since a hit
+    full += twist + [1.0, -1.0, 1.0] + [-1.0, 1.0, -1.0] + plane + [1.0]              # owed progress, reserved zero slot
     self.register_buffer("seen_sign", torch.tensor(seen), persistent=False)
     self.register_buffer("full_sign", torch.tensor(full), persistent=False)
     self.register_buffer("mean_sign", torch.tensor(twist), persistent=False)
@@ -306,6 +334,12 @@ class SteerPolicy(nn.Module):
     policy.period = int(saved["meta"].get("period", PERIOD))
     policy.leak = float(saved["meta"].get("leak", 0.0))
     policy.turned = bool(saved["meta"].get("turned", True))        # checkpoints before 11-13 12:10 were trained with it
+    policy.training_metadata = deepcopy(saved["meta"])
+    policy.post_hit_forgiveness_lineage = forgiveness_lineage(policy.training_metadata)
+    if policy.post_hit_forgiveness_lineage:
+      warnings.warn("This steering checkpoint has post-hit forgiveness in its training ancestry "
+                    f"({policy.post_hit_forgiveness_lineage} seconds). Runtime grace=0 does not remove that learned bias.",
+                    RuntimeWarning, stacklevel=2)
     return policy
 
 
@@ -317,15 +351,17 @@ class SteerEnv:
                calm: bool = False, period: int = PERIOD, fall_cost: float = 3.0, calm_share: float = 0.5,
                size_cost: float = 0.03, leak: float = 0.0, forgive: float = 0.0, remember: bool = False,
                change_cost: float = 0.0, library: str = ""):
-    """forgive (seconds): for this long after a hit, lost progress is not counted in the reward's measure.
+    """forgive must be zero: error/reward accumulation never depends on a hit timer.
     library: the motion library the scene's course generator plays (library_v2_<name>.npz; "" = the task's own)."""
     """period: control steps per decision. The course generator looks its library up once per piece (32 steps) and
     whenever the instruction changes: a command that is replaced before the next look-up never reaches the course."""
+    forgive = _no_hit_forgiveness(forgive)  # Reject before constructing any simulation.
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.rl import RslRlVecEnvWrapper
 
     from r1wb.student.observations import load_teacher
     from r1wb.tasks import TASKS
+    from r1wb.reward_contract import require_no_hit_exemptions
     cfg = TASKS[task]["env"](play=False)
     cfg.commands["motion"].stream_period, cfg.commands["motion"].stream_share = 1, 1
     if library:
@@ -336,6 +372,7 @@ class SteerEnv:
     elif "impulse" in cfg.events:          # System 1 trained with four environments in five under hits
       cfg.events["impulse"].params["calm_fraction"] = calm_share
     cfg.scene.num_envs, cfg.seed = envs, seed
+    self.hit_time_contract = require_no_hit_exemptions(cfg)
     self.env = ManagerBasedRlEnv(cfg=cfg, device=device)
     self.wrapped = RslRlVecEnvWrapper(self.env)
     self.term = self.env.command_manager.get_term("motion")
@@ -346,15 +383,16 @@ class SteerEnv:
     self.air = torch.zeros(envs, 2, device=device)
     self.seen = None
 
-  def since_hit(self) -> torch.Tensor:
-    clock = getattr(self.env, "hit_clock", None)
-    return torch.full((self.count,), 1.0e3, device=self.device) if clock is None else clock
-
   def observation(self) -> tuple[torch.Tensor, torch.Tensor]:
-    """(what System 2 sees, what the critic sees: everything, the owed progress and the time since a hit)."""
+    """Actor features, then critic features plus owed progress and a reserved zero.
+
+    The zero preserves the old critic width for warm starts; no hit clock is read.
+    The old actor's training history remains relevant even though its critic is
+    not used at inference.
+    """
     owed, turn_owed = self.steer.progress.owed_error()
     extra = torch.cat([(owed / 0.3).clamp(-3.0, 3.0), (turn_owed / 0.5).clamp(-3.0, 3.0).unsqueeze(1),
-                       (self.since_hit() / 3.0).clamp(max=1.0).unsqueeze(1)], dim=1)
+                       torch.zeros_like(turn_owed).unsqueeze(1)], dim=1)
     return self.steer.observe(), torch.cat([self.steer.observe("full"), extra], dim=1)
 
   def reset(self):
@@ -382,7 +420,7 @@ class SteerEnv:
       dones = dones.bool()
       fell |= dones & env.termination_manager.terminated & ~ended
       ended |= dones
-      progress.after_step(self.since_hit() >= self.forgive if self.forgive > 0.0 else None)
+      progress.after_step()
       alive = (~ended).float()
       gap, heading = progress.owed_error()
       distance, heading = torch.norm(gap, dim=1), heading.abs()
@@ -420,8 +458,12 @@ def train(args) -> None:
   env = SteerEnv(args.task, args.system1, args.envs, args.device, args.seed, args.see, args.calm, args.period, args.fall_cost,
                  args.calm_share, args.size_cost, args.leak, args.forgive, args.remember, args.change_cost, args.library)
   policy = SteerPolicy(args.see, spread=args.spread, gate=args.gate, remember=args.remember, mirror=args.mirror).to(args.device)
+  parent_checkpoint = None
   if args.start is not None:                                   # goes on from a saved loop (its critic too)
-    policy.load_state_dict(torch.load(args.start, map_location=args.device, weights_only=False)["state"])
+    saved = torch.load(args.start, map_location=args.device, weights_only=False)
+    policy.load_state_dict(saved["state"])
+    parent_checkpoint = {"path": str(args.start), "sha256": hashlib.sha256(Path(args.start).read_bytes()).hexdigest(),
+                         "training_meta": deepcopy(saved.get("meta", {}))}
   optimiser = torch.optim.Adam(policy.parameters(), lr=args.rate)
   seen, everything = env.reset()
   gamma, lam, horizon = 0.97, 0.95, args.horizon
@@ -489,7 +531,11 @@ def train(args) -> None:
                                                            iterations=iteration + 1, envs=args.envs, calm=args.calm,
                                                            period=args.period, spread=args.spread, gate=args.gate,
                                                            leak=args.leak, forgive=args.forgive, remember=args.remember,
-                                                           turned=False, change_cost=args.change_cost)), args.out)
+                                                           turned=False, change_cost=args.change_cost,
+                                                           reward_contract="no_hit_grace_v1", critic_clock_input="reserved_zero",
+                                                           progress_error_accumulation="unconditional_with_optional_uniform_decay",
+                                                           base_environment_contract=env.hit_time_contract,
+                                                           parent_checkpoint=parent_checkpoint)), args.out)
   print("saved", args.out)
 
 
@@ -513,8 +559,8 @@ def main() -> None:
   parser.add_argument("--spread", type=float, default=0.3, help="fixed exploration noise of the corrections (0: learned)")
   parser.add_argument("--gate", choices=["told", "learned"], default="told")
   parser.add_argument("--leak", type=float, default=0.0, help="seconds after which lost progress is forgotten (0: never)")
-  parser.add_argument("--forgive", type=float, default=0.0,
-                      help="training reward only: seconds after a hit during which lost progress is not owed (0: off)")
+  parser.add_argument("--forgive", type=_forgive_argument, default=0.0,
+                      help="must be 0; post-hit error/reward exemptions are disabled")
   parser.add_argument("--remember", action="store_true", help="System 2 also sees the gap of the decision before")
   parser.add_argument("--change-cost", type=float, default=0.0, help="price on changing the correction from one decision to the next")
   parser.add_argument("--entropy", type=float, default=0.002)

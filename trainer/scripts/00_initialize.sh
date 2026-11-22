@@ -44,6 +44,7 @@ import hashlib
 from decimal import Decimal
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -78,6 +79,9 @@ WORK_SCOPE = (
     ".agent/data/wb/library_v2_core.",
 )
 SERVER_LOCAL = (".agent/tmp/",)  # written by runs on the server itself (launch handoff); never synchronised
+# Server-only data at the trainer root: datasets (user 2026-11-20: gather all datasets in /rl-agent/dataset) and
+# external code/model downloads. Never mirrored to the PC; invisible on both sides, so excluding them deletes nothing.
+SERVER_DATA = ("dataset/", "ext/", "models/")
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=auto",
        "-o", f"ControlPath={Path.home()}/.ssh/cm-rl-%r@%h:%p", "-o", "ControlPersist=10m"]
 UV = "$HOME/.local/bin/uv"
@@ -99,10 +103,14 @@ def skipped(rel):
     # so narrowing the scope can never be read as "deleted on one side".
     parts = rel.split("/")
     return (rel.startswith(AP) and not rel.startswith(WORK_SCOPE)
-            or any(p in SKIP_DIRS for p in parts) or rel.endswith(".pyc"))
+            or rel.startswith(SERVER_DATA)
+            or any(p in SKIP_DIRS for p in parts) or rel.endswith(".pyc")
+            or (rel.startswith(".agent/runs/") and re.fullmatch(r"\..+\.[A-Za-z0-9]{6}", parts[-1]) is not None))
 
 
 def may_hold_scope(rel_dir):
+    if rel_dir.startswith(SERVER_DATA):
+        return False
     return not rel_dir.startswith(AP) or any(s.startswith(rel_dir) or rel_dir.startswith(s) for s in WORK_SCOPE)
 
 
@@ -142,12 +150,42 @@ def remote_files():
 
 
 def remote_index():
-    return {rel: entry for rel, entry in remote_files().items() if not skipped(rel)}
+    # Match the local walk's prefix pruning before traversing the remote tree.
+    # Keep remote_files() as the explicit complete audit used by --check.
+    prune = " -o ".join(f"-name {shlex.quote(d)}" for d in sorted(SKIP_DIRS))
+    allowed_parents = {".agent"}
+    subtrees = set()
+    for prefix in WORK_SCOPE:
+        if prefix.endswith("/"):
+            subtrees.add(prefix.rstrip("/"))
+            parent = Path(prefix.rstrip("/")).parent
+        else:
+            parent = Path(prefix).parent
+            allowed_parents.add(parent.as_posix())
+        while parent.as_posix() != ".":
+            allowed_parents.add(parent.as_posix())
+            parent = parent.parent
+    # All trainer-root paths remain visible; only .agent has a restricted scope.
+    keep = [f"-path {shlex.quote('./'+p)}" for p in sorted(allowed_parents)]
+    for prefix in sorted(subtrees):
+        keep.extend((f"-path {shlex.quote('./'+prefix)}", f"-path {shlex.quote('./'+prefix+'/*')}"))
+    inside = " -o ".join(keep)
+    agent_prune = f"\\( -type d -path './.agent/*' ! \\( {inside} \\) -prune \\)"
+    data_prune = " -o ".join(f"-path {shlex.quote('./' + d.rstrip('/'))}" for d in SERVER_DATA)
+    cmd = (f"mkdir -p {shlex.quote(RDIR)} && cd {shlex.quote(RDIR)} && find . "
+           f"\\( {prune} \\) -prune -o \\( {data_prune} \\) -prune -o {agent_prune} "
+           f"-o -type f -printf '%P\\t%s\\t%T@\\n'")
+    out = {}
+    for line in ssh(cmd).splitlines():
+        rel, size, mt = line.split("\t")
+        if not skipped(rel):
+            out[rel] = (int(size), int(Decimal(mt) * 1_000_000_000))
+    return out
 
 
 def out_of_scope(remote):
     """Server files that are neither the trainer folder nor needed by a run; the shared server should hold none."""
-    return sorted(rel for rel in remote if skipped(rel) and not rel.startswith(SERVER_LOCAL))
+    return sorted(rel for rel in remote if skipped(rel) and not rel.startswith(SERVER_LOCAL + SERVER_DATA))
 
 
 def timestamp_ns(entry):
@@ -191,7 +229,7 @@ def rsync(files, push):
         try:
             e = " ".join(shlex.quote(x) for x in SSH)
             # Only the selected list bypasses rsync's whole-second quick check.
-            subprocess.run(["rsync", "-a", "--ignore-times", "--files-from", lst, "-e", e, src, dst], check=True)
+            subprocess.run(["rsync", "-az", "--ignore-times", "--files-from", lst, "-e", e, src, dst], check=True)
         finally:
             os.unlink(lst)
 

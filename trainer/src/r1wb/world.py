@@ -31,6 +31,7 @@ from mjlab.entity import EntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ObjRef, RingPatternCfg, TerrainHeightSensorCfg
 from mjlab.terrains.terrain_generator import SubTerrainCfg, TerrainGeneratorCfg, TerrainGeometry, TerrainOutput
+from r1wb.performance import cached_read, device_indices
 
 SIZE = 24.0                 # m, side of the patch (a 20 s walk at 0.35 m/s stays on it)
 START = 0.75                # m, radius of the flat start disc / distance at which a ramp begins
@@ -122,6 +123,7 @@ def apply_ground(cfg, name: str, seed: int = 7) -> None:
   cfg.sim.njmax = max(cfg.sim.njmax or 0, 1600)
 
 
+@cached_read
 def root_height(env) -> torch.Tensor:
   """Pelvis height above the ground under it (m)."""
   if "root_ground" in env.scene.sensors:
@@ -129,12 +131,14 @@ def root_height(env) -> torch.Tensor:
   return env.scene["robot"].data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
 
 
+@cached_read
 def ground_under(env) -> torch.Tensor:
   """Height of the ground under the pelvis above the start level (m)."""
   root = env.scene["robot"].data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
   return root - root_height(env)
 
 
+@cached_read
 def support_under(env) -> torch.Tensor:
   """Height of the ground under the two feet (their mean) above the start level (m): the surface the robot stands on.
   On a slope it differs from the ground under the pelvis by the slope times the pelvis' lead over the feet.
@@ -143,6 +147,7 @@ def support_under(env) -> torch.Tensor:
   return feet_under(env).mean(dim=1)
 
 
+@cached_read
 def feet_under(env) -> torch.Tensor:
   """(environments, 2) height of the ground under the left and the right foot above the start level (m); zero where
   support_under is zero (no ray sensor, the step an episode starts)."""
@@ -150,12 +155,13 @@ def feet_under(env) -> torch.Tensor:
     return torch.zeros(env.num_envs, 2, device=env.device)
   robot = env.scene["robot"]
   ids = [robot.body_names.index(f"{side}_ankle_roll_link") for side in ("left", "right")]
-  foot_z = robot.data.body_link_pos_w[:, ids, 2]
+  foot_z = robot.data.body_link_pos_w[:, device_indices(env, ids), 2]
   clearance = env.scene["feet_ground_height"].data.heights.reshape(env.num_envs, -1)[:, :2]
   level = foot_z - clearance - env.scene.env_origins[:, 2:3]
   return torch.where((env.episode_length_buf < 1).unsqueeze(1), torch.zeros_like(level), level)
 
 
+@cached_read
 def standing_height(env) -> torch.Tensor:
   """Pelvis height above the surface the robot stands on (m). On the flat floor: its height above the start level."""
   root = env.scene["robot"].data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]

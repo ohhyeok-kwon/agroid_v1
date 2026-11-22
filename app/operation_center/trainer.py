@@ -60,7 +60,9 @@ class Trainer:
         self.closed = False
 
     def probe_server(self):
-        code = """import json
+        # r1lab.train processes, plus registered runs (run_info.json state starting|running) whose recorded pid or a
+        # recorded worker pid is alive and was started before the record's last write (a reused pid starts later).
+        code = 'RUNS=%r\n' % (os.environ.get('RL_REMOTE_DIR', '/rl-agent')+'/.agent/runs') + """import json, os
 from pathlib import Path
 rows=[]
 for p in Path('/proc').iterdir():
@@ -70,6 +72,19 @@ for p in Path('/proc').iterdir():
   if b'r1lab.train' not in args and not any(a.endswith(b'/r1lab/train.py') for a in args): continue
   rows.append({'pid':int(p.name),'log':(p/'fd/1').resolve().name})
  except OSError: pass
+boot=int(next(l for l in open('/proc/stat') if l.startswith('btime')).split()[1])
+seen={r['pid'] for r in rows}
+for f in Path(RUNS).glob('*/*/run_info.json'):
+ try:
+  i=json.loads(f.read_text())
+  if i.get('state') not in ('starting','running') or not isinstance(i.get('pid'),int) or i['pid'] in seen: continue
+  for q in [i['pid']]+[w.get('pid') for w in i.get('workers') or [] if isinstance(w,dict)]:
+   try:
+    s=open('/proc/%d/stat'%q).read()
+    if boot+int(s[s.rfind(')')+2:].split()[19])/os.sysconf('SC_CLK_TCK') <= (i.get('updated_at') or i.get('created_at') or 0)+5:
+     rows.append({'pid':i['pid'],'log':None,'id':i.get('id')}); break
+   except (OSError,TypeError,ValueError): pass
+ except (OSError,ValueError,AttributeError): pass
 print(json.dumps(rows))
 """
         process = None
@@ -310,7 +325,7 @@ print(json.dumps(rows))
                 progress = None if current is None or total is None or start is None else max(0, min(1, (current - start + 1) / max(1, total - start)))
                 modified = max(log.stat().st_mtime if log else 0, (run/'run_info.json').stat().st_mtime)
                 complete = current is not None and total is not None and current >= total - 1
-                running = server['connected'] and any(p.get('pid') == info.get('pid') if registered else end is None and log and p.get('log') == log.name for p in server['processes'])
+                running = server['connected'] and any(p.get('pid') == info.get('pid') and p.get('id', rid) == rid if registered else end is None and log and p.get('log') == log.name for p in server['processes'])
                 failed = 'Traceback (most recent call last)' in tail or bool(re.search(r'^(?:\w*Error|CUDA error):', tail, re.M))
                 if registered and info.get('state') in ('completed', 'failed', 'stopped'):
                     state = info['state']

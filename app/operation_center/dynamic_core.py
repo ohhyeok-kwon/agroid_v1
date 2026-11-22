@@ -12,6 +12,7 @@ Simulation 작업 프로세스(dynamic_worker, 로봇 1대)와 비교 시험(.ag
 """
 from __future__ import annotations
 
+import copy
 import math
 import os
 from dataclasses import dataclass
@@ -235,7 +236,14 @@ class SceneRenderer:
 
     def __init__(self, core: DynamicCore, width: int = 960, height: int = 600):
         self.core, self.width, self.height = core, width, height
-        self.model = core.env.sim.mj_model
+        # Parked projectiles inflate the simulation bounds to ~67 m, centred 33 m
+        # above the floor. OpenGL's resulting shadow map produces striped planes.
+        # Keep display bounds local, on a copy: physics and the policy camera use
+        # the original model, including its terrain, materials and sensor settings.
+        self.model = copy.copy(core.env.sim.mj_model)
+        self.model.stat.extent = 10.0
+        self.model.vis.map.znear = 0.02 / self.model.stat.extent
+        self.model.vis.map.zfar = 200.0 / self.model.stat.extent
         self.model.vis.global_.offwidth = max(int(self.model.vis.global_.offwidth), width)
         self.model.vis.global_.offheight = max(int(self.model.vis.global_.offheight), height)
         self.data = mujoco.MjData(self.model)
@@ -255,6 +263,7 @@ class SceneRenderer:
 
     def scene(self):
         self.camera.lookat[:] = self.data.xpos[self.root_body]
+        self.model.stat.center[:] = self.camera.lookat
         self.renderer.update_scene(self.data, camera=self.camera)
         return self.renderer.scene
 

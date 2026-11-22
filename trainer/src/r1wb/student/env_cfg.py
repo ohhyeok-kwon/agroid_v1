@@ -125,6 +125,7 @@ class ImitationPpoCfg(RslRlPpoAlgorithmCfg):
   final_learning_rate: float | None = 1.0e-4
   lr_decay_updates: int = 4000
   ramp_learning_rate: bool = False              # multiply the rate by the surrogate ramp (needed when bc_coef is 0)
+  global_statistics: bool = False              # merge normalizers and rollout advantages across training ranks
 
 
 def student_rl_cfg() -> RslRlOnPolicyRunnerCfg:

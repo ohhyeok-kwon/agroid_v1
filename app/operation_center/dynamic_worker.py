@@ -31,6 +31,10 @@ if __name__ == '__main__':
 PROJECT = Path(__file__).resolve().parents[2]
 IDLE_EXIT = 30.0               # s without any input: the process ends and frees the GPU
 DECISION = 16                  # control steps between two System 2 decisions (0.32 s)
+MODELS = ('e114', 'b0', 'sonic', 'sonic_b0')   # 연결 모델: E114(전신 스택, dynamic_mode.json; 기본) · B0(S1 목적,
+                                               # dynamic_mode_b0.json) · SONIC-R1(현재 학습 / 이식 B@0, dynamic_sonic)
+SONIC_MODELS = ('sonic', 'sonic_b0')
+UNSUPPORTED_S = 4.0            # s an 'unsupported' note stays on screen (SONIC-R1 has no crouch / rise)
 
 
 def emit(state, frame=b''):
@@ -184,6 +188,9 @@ class Inputs:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--environment', default='flat')
+    # 서버(simulation.py)가 화면에서 고른 모델을 넘긴다(기본 E114). 모델을 넘기지 않는 호출(모델 선택 이전에 띄운 앱의
+    # 서버)도 E114 를 연다.
+    parser.add_argument('--model', choices=MODELS, default='e114')
     args = parser.parse_args()
     lock = threading.Lock()
     command = {'axes': [0, 0], 'active': True, 'reset': False, 'received': time.monotonic(),
@@ -214,8 +221,10 @@ def main():
         closed.set()
     threading.Thread(target=inputs, daemon=True).start()
 
-    emit({'state': 'loading', 'action': 'dynamic_mode', 'environment': args.environment,
-          'message': 'DynamicMode 스택(목표 → 조향 고리 → 운동 토큰 → 추종 정책)을 불러오는 중입니다.'})
+    emit({'state': 'loading', 'action': 'dynamic_mode', 'environment': args.environment, 'model': args.model,
+          'message': 'B0(S1 목적) 정책과 학습 env 를 불러오는 중입니다.' if args.model == 'b0' else
+                     'SONIC-R1 추종기와 참조 합성기를 불러오는 중입니다.' if args.model in SONIC_MODELS else
+                     'DynamicMode 스택(목표 → 조향 고리 → 운동 토큰 → 추종 정책)을 불러오는 중입니다.'})
     import numpy as np
     import torch
     from PIL import Image
@@ -226,20 +235,46 @@ def main():
     from simulation_worker import terrain
 
     import dynamic_mode
-    from dynamic_core import DynamicCore, SceneRenderer
 
-    selection = dynamic_mode.load_manifest(PROJECT)
-    core = DynamicCore(selection, environment=args.environment, envs=1, camera=selection.get('goal_model') is not None)
-    renderer = SceneRenderer(core)
-    reader = GoalReader(selection, core.device)
+    sonic = args.model in SONIC_MODELS
+    if sonic:
+        # SONIC-R1: SONIC 추종기 하나(CPU)와 calm 인과 합성기 참조(별도 프로세스). 5값 명령 중 (vx, vy, 회전율)만 쓰고
+        # 앉기·일어서기는 서 있기로 둔다. 문장을 읽는 목표 모델은 E114 선택 파일의 것을 쓴다(dynamic_sonic).
+        import dynamic_sonic
+        selection = dynamic_sonic.load_manifest(PROJECT, args.model)
+        core = dynamic_sonic.SonicCore(selection, environment=args.environment)
+        info = {'model': args.model, 'label': selection['label'], 'run_id': selection['run_id'], 'iteration': selection['step'],
+                'selection_note': dynamic_sonic.selection_note(selection), 'parts': dynamic_sonic.PARTS,
+                'inputs': dynamic_sonic.INPUTS}
+    elif args.model == 'b0':
+        from dynamic_core import SceneRenderer
+        # B0(S1 목적): 5값 명령을 S1 목표로 바꿔 정책 하나에 준다. E114 전용 부품(조향 고리·운동 토큰 머리·토큰기·
+        # 라이브러리)은 B0 에 맞지 않아 건너뛴다. 문장을 읽는 목표 모델은 그대로 쓴다(dynamic_b0).
+        import dynamic_b0
+        selection = dynamic_b0.load_manifest(PROJECT)
+        core = dynamic_b0.B0Core(selection, environment=args.environment, envs=1, camera=selection.get('goal_model') is not None)
+        info = {'model': 'b0', 'label': selection['label'], 'run_id': selection['run_id'], 'iteration': selection['iteration'],
+                'selection_note': selection['note'], 'parts': 'S1 목표 직접 · 조향 고리·운동 토큰 머리·라이브러리 건너뜀(E114 전용)',
+                'inputs': dynamic_b0.WIDTH}
+    else:
+        from dynamic_core import DynamicCore, SceneRenderer
+        selection = dynamic_mode.load_manifest(PROJECT)
+        core = DynamicCore(selection, environment=args.environment, envs=1, camera=selection.get('goal_model') is not None)
+        info = {'model': 'e114', 'label': selection['label'], 'run_id': selection['system1']['run_id'],
+                'iteration': selection['system1']['iteration'], 'selection_note': selection['note'],
+                'parts': ' / '.join(selection[key]['name'] for key in ('head', 'tokens', 'steer', 'library')),
+                'inputs': int(core.tracker.obs_dim)}
+    info.update(goal_model=selection['goal_model']['name'] if selection.get('goal_model') else None,
+                selection_sha256=selection['selection_sha256'])
+    renderer = dynamic_sonic.SonicRenderer(core) if sonic else SceneRenderer(core)
+    reader = GoalReader(selection, getattr(core, 'reader_device', core.device))
+
+    def head_image():
+        return renderer.head_image() if sonic else core.env.scene['head_camera'].data.rgb[0].cpu().numpy()
+    unsupported_at = -1.0e9
     control = Inputs()
     objects = terrain(args.environment)
     joints = list(core.robot.joint_names)
-    system1 = selection['system1']
-    info = {'label': selection['label'], 'run_id': system1['run_id'], 'iteration': system1['iteration'],
-            'parts': ' / '.join(selection[key]['name'] for key in ('head', 'tokens', 'steer', 'library')),
-            'goal_model': selection['goal_model']['name'] if selection.get('goal_model') else None,
-            'inputs': int(core.tracker.obs_dim), 'selection_sha256': selection['selection_sha256']}
     shots, hits, last_shot, records = 0, 0, None, {}
     instruction = {'kind': 'stand'}
     ratio, message = 1.0, ''
@@ -268,6 +303,12 @@ def main():
             setattr(renderer.camera, key, value)
         active = current['active'] and started - current['received'] < 2
         fresh = started - current['received'] < 0.4
+        if not active:
+            # Pausing or leaving the tab cancels a sentence, including an in-flight read.
+            control.by_hand()
+            control.heading.clear()
+            control.posture = 'stand'
+            instruction = {'kind': 'stand'}
         if active:
             axes = current['axes'] if fresh else [0, 0]
             if current.get('speed') in dynamic_mode.SPEEDS:
@@ -279,6 +320,9 @@ def main():
                 for posture in posed:
                     if posture in dynamic_mode.POSTURES:
                         control.by_hand()
+                        control.heading.clear()
+                        if sonic and posture != 'stand':      # SONIC-R1 has no crouch / rise: it keeps standing
+                            posture, unsupported_at = 'stand', started
                         control.posture = posture
                 for words in typed:
                     words = words.strip()[:200]
@@ -289,7 +333,7 @@ def main():
                         continue
                     control.sentence(words)
                     message = ''
-                    reader.submit(words, core.env.scene['head_camera'].data.rgb[0].cpu().numpy())
+                    reader.submit(words, head_image())
                 for launch in thrown:
                     try:
                         validate_launch(launch)
@@ -309,6 +353,8 @@ def main():
             read = reader.take()
             if read is not None:
                 control.reading(read[0], read[1])
+                if sonic and control.text is not None and control.text['kind'] in ('crouch', 'rise'):
+                    control.text, control.posture, unsupported_at = {'kind': 'stand'}, 'stand', started
             yaw = float(core.yaw()[0])
             instruction = control.instruction(axes, yaw)
             core.tell(goal_of(instruction))
@@ -316,7 +362,7 @@ def main():
             sim_time += core.dt
             # a sentence is read again at the decisions, with what the camera sees now (as the evaluation does), when the reader is free
             if control.source == 'text' and control.text is not None and core.steps % DECISION == 0 and reader.idle():
-                reader.submit(control.text_words, core.env.scene['head_camera'].data.rgb[0].cpu().numpy())
+                reader.submit(control.text_words, head_image())
             for slot, (record, on_robot) in list(records.items()):
                 given = float(core.ball_given[slot, 0])
                 if not math.isnan(given):
@@ -334,11 +380,18 @@ def main():
         quaternion = data.root_link_quat_w[0].tolist()
         told, steered = core.told_and_command()
         alert = message or control.note or (reader.message if reader.state == 'error' else '')
+        if sonic and not alert and time.monotonic() - unsupported_at < UNSUPPORTED_S:
+            alert = '이 모델(SONIC-R1)은 앉기·일어서기를 지원하지 않습니다. 서 있는 채로 둡니다.'
+        if sonic and not alert:
+            alert = core.screen_note()                  # a reduced command / a restarted reference (a few seconds)
         state = {
             'state': 'running' if active else 'paused', 'action': 'dynamic_mode', 'environment': args.environment,
+            'model': args.model,
             'time': round(sim_time, 3), 'tick': core.steps, 'fallen': bool(core.fallen[0]), 'message': alert,
             'policy': None, 'teacher': None, 'unified': None,
             'dynamic': {**info, 'goal': dynamic_mode.describe(instruction), 'goal_id': vocabulary.identifier(instruction),
+                        's1': core.goal_state() if args.model == 'b0' else None,
+                        'sonic': core.reference_state() if sonic else None,
                         'source': control.source, 'posture': control.posture, 'speed': control.speed,
                         'told': [round(float(v), 3) for v in told[0]], 'command': [round(float(v), 3) for v in steered[0]],
                         'text': {'state': reader.state if reader.available() else 'none', 'words': control.text_words,
@@ -356,7 +409,7 @@ def main():
             'pose': {'tick': core.steps, 'joints': dict(zip(joints, map(float, data.joint_pos[0]))),
                      'quaternion': quaternion, 'position': position}}
         frame = b''
-        if active or camera_changed or first:
+        if active or camera_changed or first or current['reset']:
             renderer.sync()
             output = io.BytesIO()
             Image.fromarray(renderer.render()).save(output, format='JPEG', quality=85)

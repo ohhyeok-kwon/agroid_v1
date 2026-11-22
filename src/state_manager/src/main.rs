@@ -222,7 +222,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let input = Arc::clone(&manager);
         _learned_policies.push(node.create_subscription::<RosString, _>(
             topic.keep_last(1).reliable().transient_local(),
-            move |message: RosString| input.lock().unwrap().receive_policy(action, &message.data),
+            move |message: RosString| {
+                input.lock().unwrap().receive_policy(action, &message.data, mono_ms())
+            },
         )?);
     }
     let input = Arc::clone(&manager);

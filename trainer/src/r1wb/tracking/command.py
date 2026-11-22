@@ -18,6 +18,7 @@ import torch
 
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
+from r1wb.performance import cached_read, device_indices, fixed_bincount
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -25,6 +26,44 @@ if TYPE_CHECKING:
 
 class LibraryMotionCommand(MotionCommand):
   cfg: LibraryMotionCommandCfg
+
+  joint_pos = property(cached_read(MotionCommand.joint_pos.fget))
+  joint_vel = property(cached_read(MotionCommand.joint_vel.fget))
+  body_quat_w = property(cached_read(MotionCommand.body_quat_w.fget))
+  body_lin_vel_w = property(cached_read(MotionCommand.body_lin_vel_w.fget))
+  body_ang_vel_w = property(cached_read(MotionCommand.body_ang_vel_w.fget))
+  anchor_quat_w = property(cached_read(MotionCommand.anchor_quat_w.fget))
+  anchor_lin_vel_w = property(cached_read(MotionCommand.anchor_lin_vel_w.fget))
+  anchor_ang_vel_w = property(cached_read(MotionCommand.anchor_ang_vel_w.fget))
+  robot_body_pos_w = property(cached_read(MotionCommand.robot_body_pos_w.fget))
+  robot_body_quat_w = property(cached_read(MotionCommand.robot_body_quat_w.fget))
+  robot_body_lin_vel_w = property(cached_read(MotionCommand.robot_body_lin_vel_w.fget))
+  robot_body_ang_vel_w = property(cached_read(MotionCommand.robot_body_ang_vel_w.fget))
+
+  def reset(self, env_ids):
+    if "_r1wb_read_cache" not in self._env.__dict__:
+      return super().reset(env_ids)
+    # CommandTerm.reset, with the same reductions and resample order but one
+    # device-to-host transfer for all metrics. MotionCommand clears pending forward.
+    assert isinstance(env_ids, torch.Tensor)
+    names, values = [], []
+    fast = (self._env.__dict__.get("_r1wb_fast_resets", False) and env_ids.ndim == 1
+            and env_ids.dtype in (torch.int32, torch.int64))
+    for name, value in self.metrics.items():
+      names.append(name)
+      values.append(value[env_ids].mean())
+      if fast:
+        value.index_fill_(0, env_ids, 0.0)
+      else:
+        value[env_ids] = 0.0
+    extras = dict(zip(names, torch.stack(values).tolist())) if values else {}
+    if fast:
+      self.command_counter.index_fill_(0, env_ids, 0)
+    else:
+      self.command_counter[env_ids] = 0
+    self._resample(env_ids)
+    self._pending_forward = False
+    return extras
 
   def __init__(self, cfg: LibraryMotionCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
@@ -69,6 +108,7 @@ class LibraryMotionCommand(MotionCommand):
     return world.support_under(self._env)
 
   @property
+  @cached_read
   def anchor_pos_w(self) -> torch.Tensor:
     position = super().anchor_pos_w
     support = self._support()
@@ -77,6 +117,7 @@ class LibraryMotionCommand(MotionCommand):
     return position
 
   @property
+  @cached_read
   def body_pos_w(self) -> torch.Tensor:
     position = super().body_pos_w
     if self.cfg.on_support and getattr(self, "_placing", False):
@@ -89,7 +130,8 @@ class LibraryMotionCommand(MotionCommand):
         from r1wb import world
         if not hasattr(self, "_foot_bodies"):
           self._foot_bodies = [list(self.cfg.body_names).index(f"{side}_ankle_roll_link") for side in ("left", "right")]
-        position[:, self._foot_bodies, 2] += world.feet_under(self._env) - support.unsqueeze(1)
+        ids = device_indices(self._env, self._foot_bodies)
+        position[:, ids, 2] += world.feet_under(self._env) - support.unsqueeze(1)
     return position
 
   def allow_clips(self, allowed: torch.Tensor) -> None:
@@ -104,9 +146,13 @@ class LibraryMotionCommand(MotionCommand):
   # -- reference preview ------------------------------------------------------------------------------------
 
   @property
+  @cached_read
   def command(self) -> torch.Tensor:
     """Current reference joint state, then per preview step: joint angles, anchor displacement in the current
     reference anchor's yaw frame, and the relative anchor rotation (first two matrix columns)."""
+    table = self.__dict__.get("_r1wb_reference_table")
+    if table is not None:
+      return table[self.time_steps]
     parts = [self.joint_pos, self.joint_vel]
     if len(self.future):
       anchor = self.motion_anchor_body_index
@@ -145,6 +191,11 @@ class LibraryMotionCommand(MotionCommand):
       return
     failed = self._env.termination_manager.terminated[env_ids]
     clips = self.clip_ids[env_ids]
+    if self._env.__dict__.get("_r1wb_fast_resets", False):
+      self.clip_failures.scatter_add_(0, clips, failed.float())
+      done = self.clip_finished[env_ids] & ~failed
+      self.clip_completions.scatter_add_(0, clips, done.float())
+      return
     self.clip_failures.scatter_add_(0, clips[failed], torch.ones_like(clips[failed], dtype=torch.float))
     done = self.clip_finished[env_ids] & ~failed
     self.clip_completions.scatter_add_(0, clips[done], torch.ones_like(clips[done], dtype=torch.float))
@@ -152,12 +203,18 @@ class LibraryMotionCommand(MotionCommand):
   def _adaptive_sampling(self, env_ids: torch.Tensor):
     self._count_outcomes(env_ids)
     failed = self._env.termination_manager.terminated[env_ids]
-    if torch.any(failed):
+    fast = self._env.__dict__.get("_r1wb_fast_resets", False)
+    if fast:
+      bins = self._bins(self.time_steps[env_ids])
+      self._step_fails += torch.zeros(self.bin_count, dtype=torch.long, device=self.device).scatter_add_(
+        0, bins, failed.long())
+    elif torch.any(failed):
       self._step_fails += torch.bincount(self._bins(self.time_steps[env_ids][failed]), minlength=self.bin_count)
     uniform = 1.0 / self.bin_count
     hazard = self.bin_fails / (self.bin_visits + 1e-3)
     total = hazard.sum()
-    weight = hazard / total if total > 0 else torch.full_like(hazard, uniform)
+    weight = (torch.where(total > 0, hazard / total, torch.full_like(hazard, uniform)) if fast
+              else hazard / total if total > 0 else torch.full_like(hazard, uniform))
     share = self.cfg.adaptive_uniform_share
     probability = (share * uniform + (1.0 - share) * weight).clamp(max=self.cfg.adaptive_cap * uniform)
     probability = probability * self.bin_allowed
@@ -207,7 +264,9 @@ class LibraryMotionCommand(MotionCommand):
     self.update_relative_body_poses()
     if env_ids is None and self.cfg.sampling_mode == "adaptive":
       alpha = self.cfg.adaptive_alpha
-      visits = torch.bincount(self._bins(self.time_steps), minlength=self.bin_count).float()
+      bins = self._bins(self.time_steps)
+      visits = (fixed_bincount(bins, self.bin_count) if "_r1wb_read_cache" in self._env.__dict__
+                else torch.bincount(bins, minlength=self.bin_count)).float()
       self.bin_visits = (1 - alpha) * self.bin_visits + alpha * visits
       self.bin_fails = (1 - alpha) * self.bin_fails + alpha * self._step_fails
       self._step_fails.zero_()

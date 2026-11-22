@@ -97,5 +97,8 @@ def goal_lag_l1(env: ManagerBasedRlEnv, command_name: str, yaw_weight: float = 0
 def goal_lag_exceeded(env: ManagerBasedRlEnv, command_name: str, limit_xy: float, limit_yaw: float, grace: float = 0.0):
   lag = env.command_manager.get_term(command_name).goal_lag
   exceeded = (torch.norm(lag[:, :2], dim=1) > limit_xy) | (lag[:, 2].abs() > limit_yaw)
+  if grace <= 0.0:
+    return exceeded
+  # Explicit positive grace is retained only for historical evaluation.
   clock = getattr(env, "hit_clock", None)
-  return exceeded if grace <= 0.0 or clock is None else exceeded & (clock > grace)
+  return exceeded if clock is None else exceeded & (clock > grace)

@@ -530,6 +530,9 @@ def train(args, record):
   try:
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     record.update(self_collision=ensure_robot_self_collision(env))
+    if getattr(args, "record_body_hash", False):    # option (07B 'one body definition'): robot body signature in run_info
+      from r1lab.body_hash import env_signature
+      record.update(body_signature=env_signature(env))
     env = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
     agent_cfg = asdict(agent)
     if context.is_primary:
@@ -875,6 +878,16 @@ def main(argv=None):
   ap.add_argument("--num-envs", type=int, default=4096)
   ap.add_argument("--iters", type=int, default=None)
   ap.add_argument("--seed", type=int, default=1)
+  ap.add_argument("--execution", choices=("standard", "cached", "compacted", "optimized"), default="optimized",
+                  help="whole-body execution: native, read cache, type-compacted collisions, or grouped and parallel heightfield collisions")
+  ap.add_argument("--global-statistics", action="store_true",
+                  help="whole-body ImitationPPO: merge observation statistics and rollout advantages across all GPUs")
+  ap.add_argument("--resume-next-iteration", action="store_true",
+                  help="whole-body resume: start after the saved iteration label (optimizer state and update count are preserved)")
+  ap.add_argument("--failure-replay-buffer", action="store_true",
+                  help="whole-body diagnostics: retain a bounded full-world buffer of pre-substep physics inputs on failure")
+  ap.add_argument("--reward-ledger", action="store_true",
+                  help="whole-body diagnostics: record bounded reward-time raw costs, failures, wrench and critic values")
   ap.add_argument("--run-name", default="")
   ap.add_argument("--description", default="", help="human-readable training objective shown in Trainer")
   ap.add_argument("--resume", default=None, help="checkpoint .pt to continue from")
@@ -886,6 +899,8 @@ def main(argv=None):
                   help="whole-body tasks: minibatches per epoch instead of the task's (several GPUs with the single-GPU "
                        "environment count on each: N times the task's keeps the data one gradient step sees)")
   ap.add_argument("--no-symmetry", action="store_true")
+  ap.add_argument("--record-body-hash", action="store_true",
+                  help="record the robot body signature (r1lab.body_hash: per-component sha256) in run_info.json")
   ap.add_argument("--log-root", default=None, help="must be the canonical trainer work directory's runs folder")
   ap.add_argument("--amp-disc", default=None, help="discriminator checkpoint to resume")
   ap.add_argument("--t0", type=int, default=None, help="stage start iteration (curriculum offset)")
@@ -898,6 +913,10 @@ def main(argv=None):
     ap.error("--num-envs와 --iters는 양수여야 합니다.")
   if args.mini_batches is not None and (args.mini_batches <= 0 or TASK_SPECS[args.task].get("runner") != "r1wb"):
     ap.error("--mini-batches는 전신 계열(r1wb) 과제에서 양수로만 씁니다.")
+  if (args.global_statistics or args.resume_next_iteration or args.failure_replay_buffer or args.reward_ledger) and TASK_SPECS[args.task].get("runner") != "r1wb":
+    ap.error("--global-statistics, --resume-next-iteration, --failure-replay-buffer, --reward-ledger는 전신 계열(r1wb) 과제에서만 씁니다.")
+  if args.resume_next_iteration and not args.resume:
+    ap.error("--resume-next-iteration에는 --resume이 필요합니다.")
   with RunRecord.create_distributed(args, TASK_SPECS[args.task]) as record:
     if TASK_SPECS[args.task].get("runner") == "r1wb":
       from r1wb.train import train as whole_body_train

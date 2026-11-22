@@ -14,7 +14,7 @@
 | damping_action_manager | Damping(1): kp=0, kd=4; 머리 kd=0.1 |
 | locked_standing_action_manager | MoveTo(6) → Stance(4), 최대 0.1rad/s로 기립·유지 |
 | walking_action_manager | AmpLocomotion(811): 제조사 모델·IMU·조이스틱으로 50Hz 관절 목표 계산 |
-| careful_walk_action_manager | CarefulWalk(812): 확정 조심 보행 정책, 8방향·회전·정지. `careful_walk.json`에 `command` 블록(학생 계약 v2: 한계·tick당 변화량·IMU 방향 유지)이 있으면 그 계약으로 명령 처리 |
+| careful_walk_action_manager | CarefulWalk(812): 학습 보행. 추종기 R14@100(`r14s100_tracker.onnx`, 입력 1320)과 구운 참조 묶음(`calm43s_bank.bin`, 13 명령)을 바이너리에 내장한다. 스틱 한 방향이 묶음 명령 하나(속도 단계는 출발 순간에 정해져 유지), 놓으면 0.9~1.8초 뒤 서기. 진입 뒤와 리모컨이 끊긴 뒤에는 스틱을 0.2초 가운데 둔 다음에만 방향을 받고, 리모컨이 0.5초 끊기면 바로 서기로 간다. CPU 6 고정(고정에 실패하면 준비 안 됨으로 남아 진입이 막힌다), `--self-test`로 추론·틱 시간 점검 |
 | safe_crouch_action_manager | SafeCrouch(813): 확정 웅크리기 정책, 높이 명령을 천천히 낮춰 유지 |
 
 모션 경로: action → state_manager(`/lowcmd`) → safty_manager(`/safty_manager/lowcmd`) → controller → USB.
@@ -41,7 +41,7 @@ state_manager는 최신 완전한 관절 측정으로 기립을 생성하고, sa
 | mcu·motor·bms·imu | MCU·모터·배터리·IMU 수신 해석 |
 | motor_exchange·motor_wire·r1_profile | 제조사 교환·인코딩·기체별 주소와 단위 |
 
-부팅은 zero_moment다. 보행은 기립 완료 후 R2+A, 스틱 중립 후 L2+↑로 기립 복귀한다.
+부팅은 zero_moment다. 기립 완료 후 R2+A는 제조사 보행, R2+X는 학습 보행이다. 스틱 중립(학습 보행은 서기로 돌아온 뒤) 후 L2+↑로 기립 복귀한다. 학습 동작(812·813)은 리모컨으로만 선택되고 요청 토픽은 거절한다(813은 리모컨 키가 없어 지금은 선택할 수 없다).
 보행 오류·원본 기울기 초과·명령 중단의 기존 감쇠 동작은 유지한다. DDS는 [통신 설정](04_dds.md)을 따른다.
 PC에서 `./scripts/03_deploy.sh`로 `src/`의 패키지를 자동 탐색해 모두 ARM64 Release 빌드한다. [옵션·검증·백업](01_initial_setup.md).
 새 패키지는 배포 스크립트 수정 없이 포함된다. 새 노드의 자동 실행은 해당 런치 파일을 부팅 런치에 연결해야 한다.

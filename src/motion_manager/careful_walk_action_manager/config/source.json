@@ -1,6 +1,48 @@
 {
-  "source": "trainer/actions/careful_walk/careful_walk.onnx",
-  "sha256": "59279d3760026db97b9509e91e9dde33d9b33c95166535f7ae08c8b781920708",
-  "input": "obs [1,810]",
-  "output": "actions [1,24]"
+  "model": {
+    "file": "r14s100_tracker.onnx",
+    "sha256": "b4548bf4c07fdf2521ae0a7c86f62003ee99a3e70b2adb3dd33b77fac06ac970",
+    "what": "SONIC-R1 tracker R14@100, the model pinned in the Operation Center (.agent/operation_center/dynamic_mode_sonic.json)",
+    "checkpoint": "super-via-ailab:/rl-agent/.agent/tmp/p31/ckpt/R14_b0lora_feetacc_s100_merged.pt",
+    "checkpoint_sha256": "3d97707ae66c5f543ca800112667c3a314cba3a76719a5f05d2ec970c540f4a9",
+    "export": ".agent/tmp/r1deploy/onnx/export_onnx.py (opset 17; against torch on 7,020 rollout ticks: max |difference| 2.15e-6, on ONNX Runtime 1.18.1 too)",
+    "input": "obs [1,1320] = reference encoder input 540 + proprioception history 780",
+    "output": "actions [1,24]",
+    "trained_action_delay_ms": 15
+  },
+  "reference": {
+    "file": "calm43s_bank.bin",
+    "sha256": "24387b2e79275ebd946f25fd7e8757c70ad0c2611991f0c75788f25a4e4f4f80",
+    "what": "output of the calm v4.3s generator baked per command (start, cycle, a stop at every frame)",
+    "generator": "calm43s_causal",
+    "generator_sha256": "1336ff3934972137369d464c7c4444867c60c021155e5bc5bcd5e36ac6b8b4c6",
+    "build": ".agent/tmp/r1deploy/bank/bank_build.py, checked by bank_check.py (README.md there)",
+    "commands": [
+      "fwd030",
+      "fwd050",
+      "back020",
+      "left020",
+      "right020",
+      "left030",
+      "right030",
+      "turnL030",
+      "turnR030",
+      "turnL060",
+      "turnR060",
+      "turnL100",
+      "turnR100"
+    ],
+    "known_limit": "after turning, the generator may pick a one-step stop where the bank holds the two-step one (or the reverse); both are generator output"
+  },
+  "settings": {
+    "file": "careful_walk.json",
+    "sha256": "e0189085315c3c82323af77532a40d6585b729329079b85e8ea41eea3e2b43a3",
+    "source": "trainer/src/r1lab/contract.py (joint order, default pose, gains, action scale of training)"
+  },
+  "built_in_check": {
+    "file": "tracker_golden.bin",
+    "sha256": "f10c2a83e8018ebfd042f12d27f7ca5df2bc8099b471115a1f4c4099692ace87",
+    "what": "24 observation -> action rows of the training-side deploy harness for `careful_walk_action_manager_node --self-test`",
+    "source": ".agent/tmp/r1deploy/trace, made by .agent/tmp/r1deploy/tools/make_test_assets.py"
+  }
 }

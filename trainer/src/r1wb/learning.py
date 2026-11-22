@@ -38,7 +38,8 @@ class ImitationPPO(PPO):
   def __init__(self, *args, bc_group: str = "bc", bc_coef: float = 1.0, bc_floor: float = 0.3,
                bc_decay_updates: int = 1500, critic_warmup_updates: int = 50, surrogate_ramp_updates: int = 100,
                ppo_learning_rate: float | None = None, final_learning_rate: float | None = None,
-               lr_decay_updates: int = 4000, driven_noise: float = 0.1, ramp_learning_rate: bool = False, **kwargs):
+               lr_decay_updates: int = 4000, driven_noise: float = 0.1, ramp_learning_rate: bool = False,
+               defer_metrics: bool = False, teacher_driven: bool = True, global_statistics: bool = False, **kwargs):
     super().__init__(*args, **kwargs)
     if self.rnd or self.symmetry or self.actor.is_recurrent or self.critic.is_recurrent:
       raise ValueError("ImitationPPO supports plain feed-forward actor-critic training only")
@@ -62,9 +63,72 @@ class ImitationPPO(PPO):
     # up to rounding (the anchor and a policy with a noise head compute the same mean with different kernels), and
     # Adam turns gradients of 1e-8 into full-size steps: the policy drifted 0.4 action units in one update.
     self.hold_policy_in_warmup = False
+    self.defer_metrics = defer_metrics
+    self.teacher_driven = teacher_driven
+    self.global_statistics = global_statistics
+    if global_statistics and self.normalize_advantage_per_mini_batch:
+      raise ValueError("global_statistics requires rollout-wide advantage normalization, not per-mini-batch normalization")
+
+  def _update_global_normalization(self, model, obs) -> None:
+    """Merge this step's observations from every rank into the same running statistics.
+
+    The actor's frozen normalizer remains frozen. The critic counts global samples, including when the inherited
+    statistics came from a single-GPU checkpoint; counting only local samples changes the weight of that history.
+    """
+    if not model.obs_normalization:
+      return
+    normalizer = model.obs_normalizer
+    if not normalizer.training or normalizer.until == 0:
+      return
+    if normalizer.until is not None and normalizer.count >= normalizer.until:
+      return
+    from r1lab.distributed import global_moments
+    samples = torch.cat([obs[group] for group in model.obs_groups], dim=-1)
+    mean, variance, count = global_moments(samples)
+    total = normalizer.count + count
+    rate = count.to(mean.dtype) / total
+    delta = mean - normalizer._mean
+    normalizer._mean.add_(rate * delta)
+    normalizer._var.add_(rate * (variance - normalizer._var + delta * (mean - normalizer._mean)))
+    normalizer._var.clamp_(min=0.0)
+    normalizer._std.copy_(normalizer._var.sqrt())
+    normalizer.count.copy_(total)
+
+  def process_env_step(self, obs, rewards, dones, extras) -> None:
+    if not self.global_statistics or not self.is_multi_gpu:
+      return super().process_env_step(obs, rewards, dones, extras)
+    # The standard PPO transition path, with globally merged rather than rank-local normalizer updates.
+    # ImitationPPO rejects RND, so there are no intrinsic rewards or additional normalizers to update here.
+    self._update_global_normalization(self.actor, obs)
+    self._update_global_normalization(self.critic, obs)
+    self.transition.rewards = rewards.clone()
+    self.transition.dones = dones
+    if "time_outs" in extras:
+      self.transition.rewards += self.gamma * torch.squeeze(
+        self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1)
+    self.storage.add_transition(self.transition)
+    self.transition.clear()
+    self.actor.reset(dones)
+    self.critic.reset(dones)
+
+  def compute_returns(self, obs) -> None:
+    super().compute_returns(obs)
+    if not self.global_statistics or not self.is_multi_gpu:
+      return
+    from r1lab.distributed import global_moments
+    # Reconstruct the raw advantages: the base method has already normalized its local copy.
+    raw = self.storage.returns - self.storage.values
+    mean, variance, count = global_moments(raw.reshape(-1))
+    if count < 2:
+      raise ValueError("Global advantage normalization requires at least two samples")
+    # torch.std() in the single-GPU implementation uses the sample (N-1) variance.
+    std = (variance * (count.to(variance.dtype) / (count - 1))).sqrt()
+    self.storage.advantages = (raw - mean) / (std + 1e-8)
 
   def act(self, obs):
     actions = super().act(obs)
+    if not self.teacher_driven:
+      return actions
     labels = obs[self.bc_group]
     if labels.shape[1] > actions.shape[1] + 1:
       driven = labels[:, -1] > 0.5
@@ -97,6 +161,7 @@ class ImitationPPO(PPO):
   def update(self) -> dict[str, float]:
     totals = dict(value=0.0, surrogate=0.0, entropy=0.0, imitation=0.0, imitation_legs=0.0, imitation_waist=0.0,
                   imitation_arms=0.0)
+    metrics = []
     warmup = self.update_count < self.critic_warmup_updates
     ramp = min(1.0, max(0.0, (self.update_count - self.critic_warmup_updates + 1) / max(1, self.surrogate_ramp_updates)))
     coefficient = self.imitation_coefficient()
@@ -161,7 +226,9 @@ class ImitationPPO(PPO):
         imitation = (squared.mean(dim=1) * weight).sum() / weight.sum().clamp_min(1.0)
       with torch.no_grad():        # joint order of the action: legs (12), waist (2), arms (10)
         groups = {"imitation_legs": squared[:, :12].mean(), "imitation_waist": squared[:, 12:14].mean(),
-                  "imitation_arms": squared[:, 14:].mean()}
+                  "imitation_arms": squared[:, 14:24].mean()}
+        if squared.shape[1] == 26:
+          groups["imitation_head"] = squared[:, 24:26].mean()
       extra, extra_logs = self._extra_loss(batch.observations)
       loss = self.value_loss_coef * value_loss + coefficient * imitation + extra
       if not warmup:
@@ -178,7 +245,15 @@ class ImitationPPO(PPO):
       self.optimizer.step()
       for key, value in (("value", value_loss), ("surrogate", surrogate_loss), ("entropy", entropy.mean()),
                          ("imitation", imitation), *groups.items(), *extra_logs.items()):
-        totals[key] = totals.get(key, 0.0) + value.item()
+        if self.defer_metrics:
+          metrics.append((key, value.detach()))
+        else:
+          totals[key] = totals.get(key, 0.0) + value.item()
+    if metrics:
+      # Keep the original Python-double accumulation order; only the copies move.
+      values = torch.stack([value for _, value in metrics]).tolist()
+      for (key, _), value in zip(metrics, values):
+        totals[key] = totals.get(key, 0.0) + value
     updates = self.num_learning_epochs * self.num_mini_batches
     result = {key: value / updates for key, value in totals.items()}
     result["imitation_coefficient"] = coefficient
@@ -191,11 +266,14 @@ class ImitationPPO(PPO):
   def save(self) -> dict:
     state = super().save()
     state["imitation_update_count"] = self.update_count
+    state["global_statistics"] = self.global_statistics
     return state
 
   def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
     result = super().load(loaded_dict, load_cfg, strict)
     self.update_count = int(loaded_dict.get("imitation_update_count", 0))
+    # Configuration is explicitly chosen for the new run; retain the source mode for provenance.
+    self.loaded_global_statistics = bool(loaded_dict.get("global_statistics", False))
     return result
 
 
@@ -244,6 +322,8 @@ class AnchoredPPO(ImitationPPO):
                class_advantages: bool = False, course_group: str = "", course_weight: float = 1.0,
                repeat_checkpoint: str = "", repeat_weight: float = 0.0, **kwargs):
     super().__init__(*args, **kwargs)
+    if self.global_statistics and class_advantages:
+      raise ValueError("global_statistics does not support per-class advantage normalization")
     from r1wb.student.observations import load_teacher
     if not anchor_checkpoint:
       raise ValueError("AnchoredPPO needs the checkpoint of the policy the run starts from")

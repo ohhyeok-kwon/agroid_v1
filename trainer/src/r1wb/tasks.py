@@ -2,8 +2,9 @@
 from r1wb.student import env_cfg as student
 from r1wb.tracking import env_cfg as tracking
 
-from r1wb import anchored, harden, teacher_task, walker  # noqa: E402
+from r1wb import anchored, harden, recovery_task, teacher_task, walker  # noqa: E402
 from r1wb.student import stream  # noqa: E402
+from r1wb import head_task, calm_task
 
 def _student_rl(bc: float):
   """The student's learning settings with a constant imitation weight (0 = the labels are not used)."""
@@ -14,6 +15,36 @@ def _student_rl(bc: float):
 
 
 TASKS = {
+  "wb_task_teacher_v12h_calm10": dict(env=lambda play=False, **kw: calm_task.env_cfg("10",play,**kw),
+      rl=lambda:calm_task.rl_cfg("10"),stage="P1t12h-calm10",init_from_teacher=True,head_contract=True,
+      head_perception=True,head_base="v11c",wholebody_calm=True,calm_cell="10",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h_calm01": dict(env=lambda play=False, **kw: calm_task.env_cfg("01",play,**kw),
+      rl=lambda:calm_task.rl_cfg("01"),stage="P1t12h-calm01",init_from_teacher=True,head_contract=True,
+      head_perception=True,head_base="v10s",wholebody_calm=True,calm_cell="01",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h_calm11": dict(env=lambda play=False, **kw: calm_task.env_cfg("11",play,**kw),
+      rl=lambda:calm_task.rl_cfg("11"),stage="P1t12h-calm11",init_from_teacher=True,head_contract=True,
+      head_perception=True,head_base="v11c",wholebody_calm=True,calm_cell="11",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h0_head_control_v11c": dict(env=lambda play=False, **kw: head_task.env_cfg(False,play,base_teacher="v11c",**kw),
+      rl=lambda:head_task.rl_cfg("v11c"),stage="P1t12h0c",init_from_teacher=True,head_contract=True,head_perception=False,head_base="v11c",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h_head_perception_v11c": dict(env=lambda play=False, **kw: head_task.env_cfg(True,play,base_teacher="v11c",**kw),
+      rl=lambda:head_task.rl_cfg("v11c"),stage="P1t12hc",init_from_teacher=True,head_contract=True,head_perception=True,head_base="v11c",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h0_head_control": dict(env=lambda play=False, **kw: head_task.env_cfg(False,play,**kw),
+      rl=head_task.rl_cfg,stage="P1t12h0",init_from_teacher=True,head_contract=True,head_perception=False,head_base="v10s",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h_head_perception": dict(env=lambda play=False, **kw: head_task.env_cfg(True,play,**kw),
+      rl=head_task.rl_cfg,stage="P1t12h",init_from_teacher=True,head_contract=True,head_perception=True,head_base="v10s",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h0_head_control_v11a": dict(env=lambda play=False, **kw: head_task.env_cfg(False,play,base_teacher="v11a",**kw),
+      rl=head_task.rl_cfg,stage="P1t12h0a",init_from_teacher=True,head_contract=True,head_perception=False,head_base="v11a",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
+  "wb_task_teacher_v12h_head_perception_v11a": dict(env=lambda play=False, **kw: head_task.env_cfg(True,play,base_teacher="v11a",**kw),
+      rl=head_task.rl_cfg,stage="P1t12ha",init_from_teacher=True,head_contract=True,head_perception=True,head_base="v11a",
+      require_reward_ledger=True,ledger_profile="compact_v2",strict_reward_ledger=True),
   "wb_track_teacher": dict(env=tracking.tracking_env_cfg, rl=tracking.tracking_rl_cfg, stage="P1"),
   # resume a finished P1 teacher under the conditions the student trains in (needs --resume)
   "wb_track_teacher_dr": dict(env=lambda play=False, first_clip=0, **kw: tracking.tracking_env_cfg(
@@ -223,6 +254,85 @@ TASKS = {
                                           decisive_course=True, course_cap=0.12, ground=True, **kw),
                                         rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
                                         init_from_teacher=True, pad_inputs=True),
+  # A single direct motion-cost contrast on the current 294-input terrain policy; all original rewards remain.
+  "wb_task_teacher_v4_ground_sym_motion": dict(env=lambda play=False, **kw: teacher_task.teacher_task_env_cfg(
+                                                 play=play, disturbance="impulse_events_full", joint_course=135.0,
+                                                 failure_cost=3000.0, coherent_course=True, row_share=0.125,
+                                                 decisive_course=True, course_cap=0.12, ground=True,
+                                                 motion_cost=0.1, **kw),
+                                               rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                               init_from_teacher=True, pad_inputs=True),
+  # Same episode-reset repair in both arms; the bounded recovery cost is the only A/B reward change.
+  "wb_task_teacher_v5_recovery_control": dict(env=lambda play=False, **kw: teacher_task.teacher_task_env_cfg(
+                                                 play=play, disturbance="impulse_events_full", joint_course=135.0,
+                                                 failure_cost=3000.0, coherent_course=True, row_share=0.125,
+                                                 decisive_course=True, course_cap=0.12, ground=True,
+                                                 recovery_cost=0.0, reset_impulses=True, **kw),
+                                               rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                               init_from_teacher=True, pad_inputs=True, require_reward_ledger=True),
+  "wb_task_teacher_v5_recovery_risk": dict(env=lambda play=False, **kw: teacher_task.teacher_task_env_cfg(
+                                              play=play, disturbance="impulse_events_full", joint_course=135.0,
+                                              failure_cost=3000.0, coherent_course=True, row_share=0.125,
+                                              decisive_course=True, course_cap=0.12, ground=True,
+                                              recovery_cost=2.0, reset_impulses=True, **kw),
+                                            rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                            init_from_teacher=True, pad_inputs=True, require_reward_ledger=True),
+  "wb_task_teacher_v6_exposure_control": dict(env=lambda play=False, **kw: recovery_task.env_cfg("control", play, **kw),
+                                               rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                               init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                               ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v6_exposure_pose": dict(env=lambda play=False, **kw: recovery_task.env_cfg("pose", play, **kw),
+                                            rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                            init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                            ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v6_exposure_predict": dict(env=lambda play=False, **kw: recovery_task.env_cfg("predict", play, **kw),
+                                               rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                               init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                               ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v7_no_hit_grace_control": dict(env=lambda play=False, **kw: recovery_task.no_hit_grace_env_cfg("control", play, **kw),
+                                                rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                                init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                                ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v7_no_hit_grace_pose": dict(env=lambda play=False, **kw: recovery_task.no_hit_grace_env_cfg("pose", play, **kw),
+                                             rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                             init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                             ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v7_no_hit_grace_predict": dict(env=lambda play=False, **kw: recovery_task.no_hit_grace_env_cfg("predict", play, **kw),
+                                                rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                                init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                                ledger_profile="compact_v2", strict_reward_ledger=True),
+  # ... v8 (Claude 11-15): the v7 control whose episodes end only on a fall, the trunk on the ground or time
+  # (recovery_task.physical_ends_env_cfg; review 20261115-0303, diagnostic claude_v6c_20261115)
+  "wb_task_teacher_v8_physical_ends_control": dict(env=lambda play=False, **kw: recovery_task.physical_ends_env_cfg("control", play, **kw),
+                                                 rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                                 init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                                 ledger_profile="compact_v2", strict_reward_ledger=True),
+  # ... v8b (Claude 11-15): v8 bisect keeping the leaky goal-lag ending (recovery_task.plan_free_env_cfg)
+  "wb_task_teacher_v8b_plan_free_control": dict(env=lambda play=False, **kw: recovery_task.plan_free_env_cfg("control", play, **kw),
+                                              rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                              init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                              ledger_profile="compact_v2", strict_reward_ledger=True),
+  # ... v9a (Claude 11-15): v8 + the arms' action-rate price (recovery_task.arm_smooth_env_cfg, weight -1)
+  "wb_task_teacher_v9a_arm_smooth_control": dict(env=lambda play=False, **kw: recovery_task.arm_smooth_env_cfg("control", play, **kw),
+                                               rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                               init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                               ledger_profile="compact_v2", strict_reward_ledger=True),
+  # Stage T: scan is mandatory for every new teacher. Existing tasks stay frozen.
+  "wb_task_teacher_v10s_scan": dict(env=lambda play=False, **kw: recovery_task.height_scan_env_cfg("control", play, **kw),
+                                   rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t10s", init_from_teacher=True, pad_inputs=True, require_reward_ledger=True, ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v11a_scan_upper_course": dict(env=lambda play=False, **kw: recovery_task.upper_body_scan_env_cfg("control", play, **kw),
+                                   rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t11a", init_from_teacher=True, pad_inputs=True, require_reward_ledger=True, ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v11c_scan_noise_consistency": dict(env=lambda play=False, **kw: recovery_task.noise_consistency_scan_env_cfg("control", play, **kw),
+                                   rl=recovery_task.noise_consistency_scan_rl_cfg, stage="P1t11c", init_from_teacher=True, pad_inputs=True, require_reward_ledger=True, ledger_profile="compact_v2", strict_reward_ledger=True),
+  # ... v9c (Claude 11-15): v8 + the goal-lag reward's heading share 0.3 -> 1.5 (recovery_task.heading_return_env_cfg)
+  "wb_task_teacher_v9c_heading_return_control": dict(env=lambda play=False, **kw: recovery_task.heading_return_env_cfg("control", play, **kw),
+                                                   rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                                   init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                                   ledger_profile="compact_v2", strict_reward_ledger=True),
+  "wb_task_teacher_v9d_heading_arm_smooth": dict(env=lambda play=False, **kw: recovery_task.heading_arm_smooth_env_cfg("control", play, **kw),
+                                               rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
+                                               init_from_teacher=True, pad_inputs=True, require_reward_ledger=True,
+                                               ledger_profile="compact_v2", strict_reward_ledger=True),
   # ... where the policy also reads the last 0.2 s of its own body and the ground around it (r1wb.senses; the other
   # end of the design's first experiment: gates 11-14 05:xx, hypothesis S1), and the history alone
   "wb_task_teacher_v4_ground_sym_senses": dict(env=lambda play=False, **kw: teacher_task.teacher_task_env_cfg(
@@ -238,7 +348,8 @@ TASKS = {
                                                 rl=lambda: teacher_task.teacher_task_rl_cfg(symmetric=True), stage="P1t",
                                                 init_from_teacher=True, pad_inputs=True),
   # ... with the fall priced four times higher: on shaped ground the posture price runs for the whole episode (up to
-  # 162 at the cap) against 60 for a fall (gates 11-14 03:2x, hypothesis G4)
+  # 162 undiscounted at the cap; discounted cap alone is32.187, not proof of a failure incentive) against60 for a fall
+  # (gates 11-14 03:2x, hypothesis G4).
   "wb_task_teacher_v4_ground_sym_fall12000": dict(env=lambda play=False, **kw: teacher_task.teacher_task_env_cfg(
                                                     play=play, disturbance="impulse_events_full", joint_course=135.0,
                                                     failure_cost=12000.0, coherent_course=True, row_share=0.125,
@@ -546,3 +657,60 @@ TASKS = {
   "wb_harden_norelief": dict(env=lambda play=False, teacher=None, **kw: harden.harden_env_cfg(play, teacher, relief=False, **kw),
                              rl=harden.harden_rl_cfg, stage="P3", teacher=True, zero_init=True),
 }
+
+
+# R12 S1 (positive 22, coordinator 2026-11-19 18:5x; .agent/adversarial/rounds/R04/positive/r12_s1): System 1 from random
+# weights on one outcome goal (masked pelvis displacement / heading / height with a deadline), physical failures only,
+# success + potential difference + one effort price. Code in the new package r1s1, imported lazily.
+def _s1_task(effort):
+  def env(play=False, **kw):
+    from r1s1.tasks import _env
+    return _env(effort, play=play, **kw)
+  def rl():
+    from r1s1.tasks import _rl
+    return _rl()
+  return dict(env=env, rl=rl, stage=f"S1-S0-{effort}", s1=True)
+for _effort in ("joule", "power"):
+  TASKS[f"wb_s1_s0_{_effort}"] = _s1_task(_effort)
+
+
+# R12 S1 S0b (positive 22, coordinator 2026-11-20 04:1x-04:3x; negative 18 addenda 31-34, freezes 56-59): S0 unchanged
+# run by r1s1.learning.S1PPO (records + in-run gates; the fix slot is open, coordinator 05:2x).
+def _s1_s0b_task(name):
+  def env(play=False, **kw):
+    from r1s1.tasks import TASKS as _s1
+    return _s1[name]["env"](play=play, **kw)
+  def rl():
+    from r1s1.tasks import TASKS as _s1
+    return _s1[name]["rl"]()
+  return dict(env=env, rl=rl, stage=name, s1=True)
+TASKS["wb_s1_s0b_power"] = _s1_s0b_task("wb_s1_s0b_power")
+
+
+# R12 S1 S0b sigma arms (positive 22, coordinator 2026-11-20 06:1x; negative 18 addendum 37): prepared, not chosen. S0b
+# with the policy std mirror-tied (tied), in log space (log) or both (tied_log); r1s1.distribution, lazy imports.
+for _sigma in ("tied", "log", "tied_log"):
+  TASKS[f"wb_s1_s0b_power_{_sigma}"] = _s1_s0b_task(f"wb_s1_s0b_power_{_sigma}")
+
+
+# R12 S1 S0b fixed sigma (positive 22, coordinator 2026-11-20 07:5x): S0 with the policy std a constant per-joint vector
+# from the records (r1s1.distribution.FixedGaussian, numbers.FIXED_STD) and post-deadline records; lazy imports.
+TASKS["wb_s1_s0b_power_fixed"] = _s1_s0b_task("wb_s1_s0b_power_fixed")
+
+
+# R13 S1 positive control (positive 23, coordinator 2026-11-20 09:2x-09:5x; negative 18 addenda 46-47): DIAGNOSTIC ONLY,
+# not adopted. S0b-fixed with the careful_walk stage-1 velocity-tracking reward block (r1s1.posctl); lazy imports.
+def _s1_posctl_task(name):
+  def env(play=False, **kw):
+    from r1s1.tasks import TASKS as _s1
+    return _s1[name]["env"](play=play, **kw)
+  def rl():
+    from r1s1.tasks import TASKS as _s1
+    return _s1[name]["rl"]()
+  return dict(env=env, rl=rl, stage=name, s1=True)
+TASKS["wb_s1_posctl_walk"] = _s1_posctl_task("wb_s1_posctl_walk")
+
+
+# R13 S1 dense base (positive 23, coordinator 2026-11-20 10:1x): DIAGNOSTIC, not adopted. S0b-fixed with objective v2 plus
+# one dense tracking term per moving goal kind at the goal spec's fixed rates (r1s1.posctl); lazy imports.
+TASKS["wb_s1_posctl_dense"] = _s1_posctl_task("wb_s1_posctl_dense")
